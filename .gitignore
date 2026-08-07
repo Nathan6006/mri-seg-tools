@@ -1,0 +1,17 @@
+# No imaging data or study metadata in this repo, ever.
+*.dcm
+*.SUR
+*.nii
+*.nii.gz
+*.itksnap
+*.xlsx
+derived/
+results/
+checksums/
+manifest.csv
+pairs.csv
+
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
