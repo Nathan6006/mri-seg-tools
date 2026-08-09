@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tumour Segmentation</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#fff; --ink:#16191d; --muted:#6b7280; --line:#e3e6ea;
+    --accent:#2563eb; --ok:#15803d; --warn:#b45309; --bad:#b91c1c;
+    --stub:#7c2d12; --stub-bg:#fef3c7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+       background:var(--bg);color:var(--ink)}
+  button{font:inherit;cursor:pointer;border:1px solid var(--line);background:#fff;
+         border-radius:7px;padding:7px 12px}
+  button:hover:not(:disabled){background:#f0f2f5}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  button.primary:hover:not(:disabled){background:#1d4ed8}
+  button.ghost{border-color:transparent;background:transparent;color:var(--muted);
+       padding:4px 8px}
+  button.ghost:hover:not(:disabled){background:#eceff3;color:var(--ink)}
+  input,textarea,select{font:inherit;padding:7px 10px;border:1px solid var(--line);
+       border-radius:7px;background:#fff}
+  code{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;background:#eef0f3;
+       padding:1px 5px;border-radius:4px}
+  .spacer{flex:1}
+  .meta{color:var(--muted);font-size:12px}
+  .row{display:flex;gap:8px;align-items:center}
+  .grow{flex:1 1 auto;min-width:0}
+
+  #stubBanner{display:none;background:var(--stub-bg);color:var(--stub);
+       border-bottom:2px solid #f59e0b;padding:10px 20px;font-weight:600;
+       text-align:center;font-size:13px}
+
+  header{background:var(--panel);border-bottom:1px solid var(--line);
+       padding:12px 20px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0;font-weight:650}
+
+  main{display:grid;grid-template-columns:calc(min(360px, 32vw)) 1fr;
+       height:calc(100vh - 58px)}
+  #listPane{border-right:1px solid var(--line);background:var(--panel);
+       display:flex;flex-direction:column;min-height:0}
+  #listTools{padding:10px 12px;border-bottom:1px solid var(--line);
+       display:flex;flex-direction:column;gap:8px}
+  #list{overflow-y:auto;flex:1}
+  #detail{overflow-y:auto;padding:20px}
+
+  .setup{padding:28px 20px;max-width:820px;margin:0 auto}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+       padding:20px;margin-bottom:16px}
+  .card h2{margin:0 0 4px;font-size:15px}
+  .card p.hint{margin:0 0 14px;color:var(--muted);font-size:13px}
+
+  /* ---- drop zone ---- */
+  #drop{border:2px dashed #cbd2da;border-radius:12px;padding:34px 20px;
+       text-align:center;background:#fbfcfd;transition:.15s}
+  #drop.hot{border-color:var(--accent);background:#eff5ff}
+  #drop .big{font-size:15px;font-weight:600;margin-bottom:4px}
+
+  /* ---- staged folders ---- */
+  #staged{margin-top:14px;border:1px solid var(--line);border-radius:10px;
+       overflow:hidden;display:none}
+  #staged .hd{background:#f7f9fb;padding:9px 14px;border-bottom:1px solid var(--line);
+       display:flex;align-items:center;gap:10px;font-size:13px}
+  #stagedList{max-height:260px;overflow-y:auto}
+  .st{padding:8px 14px;border-bottom:1px solid #f0f2f5;display:flex;gap:10px;
+       align-items:center;font-size:13px}
+  .st:last-child{border-bottom:none}
+  .st .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .st .sz{color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums}
+  .st.bad .nm{color:var(--bad)}
+
+  /* ---- progress ---- */
+  #progress{display:none;padding:14px 20px;background:#eff6ff;
+       border-bottom:1px solid #bfdbfe}
+  .bar{height:7px;background:#dbeafe;border-radius:99px;overflow:hidden;margin-top:8px}
+  .bar>div{height:100%;background:var(--accent);width:0;transition:width .25s;
+       border-radius:99px}
+  .bar.indet>div{width:35%;animation:slide 1.1s ease-in-out infinite}
+  @keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
+
+  /* ---- case list ---- */
+  .caseitem{padding:10px 14px;border-bottom:1px solid var(--line);cursor:pointer;
+       display:flex;gap:10px;align-items:center}
+  .caseitem:hover{background:#f7f9fc}
+  .caseitem.sel{background:#eef4ff;box-shadow:inset 3px 0 0 var(--accent)}
+  .caseitem .nm{font-weight:560;font-size:13px;overflow:hidden;
+       text-overflow:ellipsis;white-space:nowrap}
+  .caseitem .sub{color:var(--muted);font-size:11.5px}
+  .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+  .dot.high{background:var(--bad)} .dot.medium{background:var(--warn)}
+  .dot.low{background:var(--ok)}
+  .chip{font-size:10.5px;padding:1px 7px;border-radius:99px;border:1px solid var(--line);
+       color:var(--muted);white-space:nowrap}
+  .chip.accepted{background:#dcfce7;color:var(--ok);border-color:#bbf7d0}
+  .chip.flagged{background:#fee2e2;color:var(--bad);border-color:#fecaca}
+  .chip.edited{background:#e0e7ff;color:#3730a3;border-color:#c7d2fe}
+  .filters{display:flex;gap:4px;flex-wrap:wrap}
+  .filters button{padding:3px 9px;font-size:11.5px;border-radius:99px}
+  .filters button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+
+  /* ---- detail ---- */
+  .viewer{display:grid;grid-template-columns:1fr 300px;gap:20px}
+  @media(max-width:1120px){.viewer{grid-template-columns:1fr}}
+  /* ---- panes ----
+     Three views of the same volume, each a canvas at NATIVE voxel resolution
+     stretched by CSS to its true physical shape. aspect-ratio is set inline
+     from the voxel spacing, which is what stops the 1.10 mm slice direction
+     from being drawn as if it were 0.16 mm like the in-plane axes. */
+  #panes{display:flex;flex-direction:column;gap:10px}
+  #reformats{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .pane{background:#000;border-radius:10px;overflow:hidden;position:relative}
+  .pinner{position:absolute;inset:0;transform-origin:center center}
+  .pinner canvas{position:absolute;inset:0;width:100%;height:100%;
+       touch-action:none}                 /* stop the browser panning mid-stroke */
+  /* One voxel must stay one square on the image and mask; the overlay carries
+     crosshairs, rulers and outlines, which want smoothing instead. */
+  .pinner canvas.px{image-rendering:pixelated}
+  .plab{position:absolute;top:8px;left:10px;color:#fff;font-size:11.5px;
+       background:rgba(0,0,0,.55);padding:2px 8px;border-radius:5px;
+       pointer-events:none}
+  #hasMask{position:absolute;top:8px;right:10px;font-size:11px;padding:2px 8px;
+       border-radius:5px;background:rgba(255,45,45,.85);color:#fff;display:none;
+       pointer-events:none}
+  #canvas{cursor:crosshair}
+  #canvas.panning{cursor:grabbing}
+  #paneCo, #paneSa{cursor:crosshair}
+  #zoomBar{position:absolute;bottom:8px;right:8px;display:flex;gap:3px;
+       background:rgba(0,0,0,.6);border-radius:8px;padding:3px;z-index:3}
+  #zoomBar button{background:transparent;border:none;color:#fff;padding:3px 8px;
+       font-size:13px;border-radius:5px;line-height:1.2}
+  #zoomBar button:hover:not(:disabled){background:rgba(255,255,255,.16)}
+  #zoomBar span{color:#cfd6de;font-size:11px;padding:4px 4px;min-width:36px;
+       text-align:center;font-variant-numeric:tabular-nums}
+
+  /* ---- mask editor ---- */
+  #polyBar{display:flex;gap:6px;align-items:center;padding:7px 12px;
+       background:#1b2027;border-radius:9px;margin:-4px 0 10px}
+  #polyBar button{background:#252c35;border-color:#333c47;color:#e8ecf1;
+       padding:4px 10px;font-size:12.5px}
+  #polyBar button:hover:not(:disabled){background:#2f3742}
+  #polyHint{color:#9aa4b1;font-size:11.5px}
+  #edBar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:9px 12px;
+       background:#111418;border-radius:9px;margin-bottom:10px}
+  #edBar button{background:#1f242b;border-color:#2c333c;color:#e8ecf1;
+       padding:5px 10px;font-size:12.5px}
+  #edBar button:hover:not(:disabled){background:#2a313a}
+  #edBar button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  #edBar .sep{width:1px;height:20px;background:#2c333c;margin:0 3px}
+  #edBar label{color:#9aa4b1;font-size:11.5px}
+  #edBar input[type=range]{width:96px}
+  #edBar .ednum{color:#c6ced8;font-size:11.5px;white-space:nowrap}
+  #polyBar .chk{color:#9aa4b1;font-size:11.5px;display:flex;gap:5px;
+       align-items:center;cursor:pointer}
+  #polyBar .chk input{width:auto;padding:0}
+  .dirty{color:#fbbf24;font-size:11.5px;font-weight:600}
+  #edStats{color:#c6ced8;font-size:11.5px;font-variant-numeric:tabular-nums}
+  input[type=range]{width:100%;margin:0}
+  /* tick marks showing which slices contain tumour */
+  .ticks{position:relative;height:9px;margin:2px 0 0}
+  .ticks i{position:absolute;top:0;width:3px;height:7px;border-radius:2px;
+       background:#ff2d2d;transform:translateX(-50%)}
+  .ticks.none::after{content:'no tumour on any slice';position:absolute;left:0;
+       top:-1px;font-size:10.5px;color:var(--muted)}
+  .reasons{list-style:none;padding:0;margin:8px 0 0}
+  .reasons li{padding:8px 10px;background:#fff8ec;border-left:3px solid var(--warn);
+       border-radius:0 6px 6px 0;margin-bottom:6px;font-size:12.5px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12.5px}
+  .kv dt{color:var(--muted)} .kv dd{margin:0;font-variant-numeric:tabular-nums}
+  .big{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums}
+  .strike{text-decoration:line-through;color:var(--muted);font-size:14px;font-weight:400}
+  .empty{color:var(--muted);text-align:center;padding:60px 20px}
+  .err{background:#fef2f2;border:1px solid #fecaca;color:var(--bad);
+       padding:10px 12px;border-radius:8px;margin-top:10px;font-size:13px}
+
+  /* ---- toasts ---- */
+  #toasts{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;
+       gap:8px;z-index:80}
+  .toast{background:var(--ink);color:#fff;padding:10px 14px;border-radius:9px;
+       font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.22);max-width:340px;
+       animation:pop .18s ease-out}
+  .toast.bad{background:var(--bad)}
+  @keyframes pop{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
+  kbd{font:11px ui-monospace,Menlo,monospace;background:#eceff3;border:1px solid #dce0e6;
+      border-bottom-width:2px;border-radius:4px;padding:1px 5px}
+
+  /* Visible focus for keyboard users, but not a ring on every mouse click. */
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+
+  /* Respect people who get motion sick or just don't want the movement. */
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{animation-duration:.001ms !important;
+      transition-duration:.001ms !important}
+  }
+
+  /* ---- review progress in the header ---- */
+  #reviewProg{display:none;align-items:center;gap:8px}
+  #reviewProg .track{width:92px;height:5px;background:var(--line);border-radius:99px;
+       overflow:hidden}
+  #reviewProg .track>div{height:100%;background:var(--ok);width:0;transition:width .3s}
+
+  /* ---- connection lost ---- */
+  #offline{display:none;background:var(--bad);color:#fff;padding:8px 20px;
+       text-align:center;font-size:13px;font-weight:600}
+
+  /* ---- image display controls ---- */
+  .ctrls{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:10px;
+       padding:10px 12px;background:var(--panel);border:1px solid var(--line);
+       border-radius:9px}
+  .ctrl{display:flex;gap:7px;align-items:center}
+  .ctrl label{font-size:11.5px;color:var(--muted);white-space:nowrap}
+  .ctrl input[type=range]{width:88px}
+  .ctrl output{font-size:11px;color:var(--muted);min-width:30px;
+       font-variant-numeric:tabular-nums}
+
+  /* ---- viewer readouts ---- */
+  #posRead{position:absolute;bottom:8px;left:10px;color:#cfd6de;font-size:11px;
+       background:rgba(0,0,0,.55);padding:2px 8px;border-radius:5px;
+       font-variant-numeric:tabular-nums;pointer-events:none;display:none}
+  #canvas.loading::after{content:'';position:absolute;inset:0;
+       background:repeating-linear-gradient(90deg,rgba(255,255,255,.05) 0 12px,
+       transparent 12px 24px);animation:shimmer .8s linear infinite;pointer-events:none}
+  @keyframes shimmer{to{background-position:24px 0}}
+
+  /* Brush outline follows the cursor: without it you are painting blind,
+     because the toolbar number means nothing next to the actual anatomy. */
+  #brushDot{position:absolute;border:1.5px solid rgba(255,255,255,.9);
+       border-radius:50%;pointer-events:none;display:none;z-index:4;
+       box-shadow:0 0 0 1px rgba(0,0,0,.55) inset, 0 0 0 1px rgba(0,0,0,.45)}
+
+  /* ---- keyboard help ---- */
+  #help{position:fixed;inset:0;background:rgba(15,18,22,.5);display:none;
+       align-items:center;justify-content:center;z-index:90;padding:24px}
+  #help.open{display:flex}
+  #help .sheet{background:var(--panel);border-radius:14px;padding:22px 24px;
+       width:min(560px,100%);max-height:80vh;overflow-y:auto;
+       box-shadow:0 20px 60px rgba(0,0,0,.3)}
+  #help h3{margin:0 0 2px;font-size:15px}
+  #help h4{margin:18px 0 6px;font-size:12px;color:var(--muted);
+       text-transform:uppercase;letter-spacing:.04em}
+  #help dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0;
+       font-size:13px;align-items:center}
+  #help dt{text-align:right;white-space:nowrap}
+  #help dd{margin:0;color:var(--muted)}
+</style>
+</head>
+<body>
+
+<div id="stubBanner"></div>
+
+<!-- Filled in by app.js when the browser will not guarantee persistent
+     storage. Empty and hidden otherwise. -->
+<div id="offline"></div>
+
+<header>
+  <h1>Tumour Segmentation</h1>
+  <span class="meta" id="hdrMeta"></span>
+  <span id="reviewProg" title="Scans you have accepted or flagged">
+    <span class="track"><div id="reviewBar"></div></span>
+    <span class="meta" id="reviewTxt"></span>
+  </span>
+  <span class="spacer"></span>
+  <button id="btnHelp" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+  <button id="btnFolder" title="Share a folder on disk with ITK-SNAP">
+    ITK-SNAP folder…</button>
+  <button id="btnRescan" title="Bring back masks you corrected in ITK-SNAP">
+    Check for edits</button>
+  <button id="btnCsv" title="Download the volume table">volumes.csv</button>
+  <button id="btnZip" title="Download masks, QC images and tables as a zip">Download all</button>
+  <button id="btnNew" class="primary">Add scans</button>
+</header>
+
+<!-- Corrected masks come back as files rather than through a shared folder;
+     see the note above $('#btnRescan') in app.js. -->
+<input type="file" id="maskPicker" accept=".nii,.gz,.nii.gz" multiple hidden>
+
+<div id="progress">
+  <div class="row">
+    <strong id="progText">Working…</strong>
+    <span class="meta" id="progCur"></span>
+    <span class="spacer"></span>
+    <span class="meta" id="progPct"></span>
+  </div>
+  <div class="bar" id="progBarWrap"><div id="progBar"></div></div>
+</div>
+
+<main id="main" style="display:none">
+  <div id="listPane">
+    <div id="listTools">
+      <input type="search" id="search" placeholder="Search scans…">
+      <div class="filters" id="filters"></div>
+      <div class="row">
+        <select id="sort" class="grow" style="font-size:12px;padding:4px 8px">
+          <option value="priority">Sort: needs review first</option>
+          <option value="name">Sort: name</option>
+          <option value="volume">Sort: largest volume</option>
+          <option value="volumeAsc">Sort: smallest volume</option>
+        </select>
+      </div>
+      <label class="meta" style="display:flex;gap:6px;align-items:center;cursor:pointer">
+        <input type="checkbox" id="autoNext" style="width:auto;padding:0">
+        Jump to the next unreviewed scan after each decision
+      </label>
+    </div>
+    <div id="list"></div>
+  </div>
+  <div id="detail"><div class="empty">Select a scan on the left.</div></div>
+</main>
+
+<div class="setup" id="setup">
+  <div class="card">
+    <h2>Add scans</h2>
+    <p class="hint">Choose one scan folder or many — each folder is one mouse at
+      one timepoint, exactly as it came off the scanner, with its
+      <code>DICOM</code> sub-folder inside. Add folders as many times as you
+      like; they queue up and run together.</p>
+    <p class="hint"><strong>Nothing is uploaded.</strong> The scans are read and
+      segmented inside this browser tab, on this machine. No image data is sent
+      anywhere, which is why this page is safe to open from a shared link.</p>
+
+    <div id="drop">
+      <div class="big">Drag scan folders here</div>
+      <div class="meta">
+        Select as many as you like in Finder and drag them in together —
+        this is the only way to add several at once.
+      </div>
+      <div class="meta" style="margin:16px 0 10px">or</div>
+      <div class="row" style="justify-content:center">
+        <button id="btnPick" class="primary">Choose one folder…</button>
+        <button id="btnPickMore" style="display:none">Add another…</button>
+      </div>
+      <div class="meta" style="margin-top:14px;max-width:52ch;margin-inline:auto">
+        The file dialog can only take <strong>one folder at a time</strong> —
+        that is a browser restriction, not a setting. Click it repeatedly to
+        queue more, or pick a parent folder to get every scan inside it.
+      </div>
+      <div class="meta" style="margin-top:10px">
+        Only <code>.dcm</code> files are read; masks and notes are skipped.
+      </div>
+    </div>
+    <input type="file" id="picker" webkitdirectory directory multiple hidden>
+
+    <div id="staged">
+      <div class="hd">
+        <strong id="stCount"></strong>
+        <span class="meta" id="stSize"></span>
+        <span class="spacer"></span>
+        <button class="ghost" id="btnClear">Clear all</button>
+      </div>
+      <div id="stagedList"></div>
+    </div>
+
+    <div class="row" style="margin-top:16px">
+      <button id="btnUpload" class="primary" disabled>Segment these scans</button>
+      <span class="meta" id="uploadHint"></span>
+      <span class="spacer"></span>
+      <label class="meta">Discard blobs under</label>
+      <input type="number" id="minVox" value="0" min="0" style="width:78px">
+      <span class="meta">voxels</span>
+    </div>
+    <div id="upErr"></div>
+  </div>
+
+  <div class="card">
+    <h2>Already segmented something?</h2>
+    <p class="hint">Results are kept in this browser, on this machine. Reopen
+      them without re-running anything.</p>
+    <button id="btnReload">Reopen last results</button>
+    <div class="meta" style="margin-top:10px" id="outDirLabel"></div>
+    <p class="hint" style="margin-top:18px">Because storage is per-browser,
+      results do not follow you to another computer and clearing site data
+      deletes them. <strong>Download all</strong> writes a zip you control —
+      masks, QC images, <code>volumes.csv</code> and <code>results.json</code>.</p>
+    <button id="btnWipe" class="ghost" style="margin-top:6px;color:var(--bad)">
+      Delete everything stored here…</button>
+  </div>
+</div>
+
+<div id="help"><div class="sheet">
+  <div class="row"><h3 style="flex:1">Keyboard shortcuts</h3>
+    <button id="helpClose">Close</button></div>
+  <h4>Moving around</h4>
+  <dl>
+    <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>previous / next scan</dd>
+    <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>previous / next slice</dd>
+    <dt>scroll</dt><dd>move through slices — or through the reformat you are over</dd>
+    <dt>click a pane</dt><dd>move the crosshair; the other panes follow</dd>
+    <dt><kbd>T</kbd></dt><dd>show or hide the coronal and sagittal panes</dd>
+    <dt><kbd>H</kbd></dt><dd>show or hide the crosshair</dd>
+    <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>zoom in, out, reset</dd>
+    <dt>⌘ / ctrl + scroll</dt><dd>zoom around the pointer</dd>
+    <dt><kbd>space</kbd> + drag</dt><dd>pan</dd>
+  </dl>
+  <h4>Reviewing</h4>
+  <dl>
+    <dt><kbd>A</kbd></dt><dd>mark the mask as correct</dd>
+    <dt><kbd>F</kbd></dt><dd>flag it for follow-up</dd>
+  </dl>
+  <h4>Editing — tools</h4>
+  <dl>
+    <dt><kbd>F</kbd></dt><dd>freehand — trace round the boundary and let go</dd>
+    <dt><kbd>P</kbd></dt><dd>polygon — click points, adjust them, then Accept</dd>
+    <dt><kbd>B</kbd> / <kbd>E</kbd></dt><dd>brush / eraser</dd>
+    <dt><kbd>A</kbd></dt><dd>adaptive brush — paints only what matches under the cursor</dd>
+    <dt><kbd>G</kbd></dt><dd>fill an enclosed gap, or remove a whole blob</dd>
+    <dt><kbd>X</kbd></dt><dd>cut — slice the mask in two along a line</dd>
+    <dt><kbd>R</kbd></dt><dd>ruler — drag to measure in mm</dd>
+    <dt><kbd>C</kbd></dt><dd>navigate — move the crosshair without painting</dd>
+    <dt><kbd>M</kbd></dt><dd>switch between adding and subtracting</dd>
+    <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>smaller / larger brush</dd>
+    <dt><kbd>alt</kbd> + drag</dt><dd>temporarily invert brush and eraser</dd>
+  </dl>
+  <h4>Editing — outlines</h4>
+  <dl>
+    <dt>press and drag</dt><dd>trace freehand; it fills when you let go</dd>
+    <dt>click</dt><dd>add a polygon point; drag one to move it</dd>
+    <dt>shift-click a point</dt><dd>delete it</dd>
+    <dt>click an edge</dt><dd>insert a point there</dd>
+    <dt><kbd>⏎</kbd></dt><dd>accept and fill the outline</dd>
+    <dt><kbd>V</kbd></dt><dd>paste the last accepted outline onto this slice</dd>
+    <dt><kbd>⌫</kbd></dt><dd>remove the last point</dd>
+    <dt><kbd>esc</kbd></dt><dd>discard the outline</dd>
+  </dl>
+  <h4>Editing — the rest</h4>
+  <dl>
+    <dt><kbd>⌘Z</kbd> / <kbd>⇧⌘Z</kbd></dt><dd>undo / redo</dd>
+    <dt><kbd>⌘S</kbd></dt><dd>save the mask</dd>
+    <dt><kbd>esc</kbd></dt><dd>leave the editor</dd>
+  </dl>
+  <p class="meta" style="margin:14px 0 0">Draw two slices a few apart, then
+    <em>Interpolate</em> fills in the ones between by blending the two shapes.
+    Faster than tracing every slice when a tumour spans several.</p>
+  <p class="meta" style="margin:12px 0 0">The coronal and sagittal panes are
+    <strong>reformats of the axial stack</strong>, not the separately acquired
+    coronal scan — so they always line up with the mask. They are for looking
+    and navigating; painting happens in the axial pane, because a whole slice of
+    tumour is only one row tall over there.</p>
+  <p class="meta" style="margin:12px 0 0">Level and window change only how the
+    scan is displayed. They never affect the mask or the volume.</p>
+  <h4>Where things live</h4>
+  <p class="meta" style="margin:0 0 10px">This page has no server. Scans are read
+    and segmented in this tab and results are stored in this browser, on this
+    machine — nothing is uploaded and nothing is written to a folder. Use
+    <strong>Download all</strong> for a copy you control.</p>
+  <h4>ITK-SNAP</h4>
+  <p class="meta" style="margin:0 0 10px">A web page cannot launch another
+    program — that is the browser sandbox, and no setting changes it. What it
+    can do is share a folder.</p>
+  <p class="meta" style="margin:0 0 10px"><strong>On Chrome or Edge:</strong>
+    press <em>ITK-SNAP folder…</em> and pick a directory once.
+    <em>Download for ITK-SNAP</em> then writes a scan straight into it, you open
+    the <code>.itksnap</code> workspace from there, and
+    <em>Check folder for edits</em> reads your corrections back with one click.</p>
+  <p class="meta" style="margin:0 0 10px"><strong>On Firefox or Safari:</strong>
+    the folder API does not exist, so <em>Download for ITK-SNAP</em> gives you a
+    zip. Unzip it, work on it, then <em>Import corrected masks</em> and select
+    the edited <code>_tumor.nii.gz</code> files.</p>
+  <p class="meta" style="margin:0">Either way the original automated mask is
+    kept untouched and both volumes are reported separately. Note that macOS
+    does not associate the <code>.itksnap</code> extension, so use
+    <em>File &gt; Open Workspace</em> in ITK-SNAP, or set <em>Open With</em> on
+    the file once in Finder.</p>
+</div></div>
+
+<div id="toasts"></div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

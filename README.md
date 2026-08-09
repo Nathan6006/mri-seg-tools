@@ -64,6 +64,54 @@ any amount of staring at overlays.
 | `src/export_nnunet.py` | nnU-Net v2 raw dataset, with custom folds that override nnU-Net's random ones |
 | `src/evaluate.py` | Detection / overlap / volume-agreement metrics |
 | `src/segment.py` | Single-scan tool: folder in, mask + volume + QC image + ITK-SNAP workspace out |
+| `web/` | The review tool: a browser app that does all of the above with **no server**. See [web/README.md](web/README.md) |
+
+## The browser tool
+
+`web/` is a static site — `index.html` plus ES modules, no build step, no
+dependencies, no backend. Point it at a folder of DICOM and it converts, runs a
+model, computes volumes, renders QC images, and gives you a three-plane viewer
+with a full mask editor: freehand, polygon, brush, adaptive brush, flood fill,
+cut, ruler, shape-based slice interpolation, window/level, and undo across the
+whole volume.
+
+**Nothing is uploaded.** The DICOM is decoded and segmented inside the browser
+tab, and `web/_headers` sets `connect-src 'self'` so the page is not permitted
+to contact any other host. That is what makes it safe to host on a public URL:
+the page is static and the data never leaves the machine it is already on.
+
+```bash
+python3 -m http.server 8000 --directory web     # then open localhost:8000
+npx wrangler pages deploy web                   # or host it
+```
+
+It is a port of a Flask app, and the geometry is the part worth trusting:
+
+* `web/test/parity.mjs` + `parity_check.py` compare the browser pipeline against
+  SimpleITK on real scans — series discovery, geometry, every voxel, the written
+  NIfTI read back, the signed distance transform against
+  `SignedMaurerDistanceMap`, and connected components against
+  `ConnectedComponent`. On a 20-session sweep **every voxel was identical as
+  float32**, and every distance field exact.
+* `web/test/run_selftest.py` runs 37 end-to-end checks in a real browser against
+  synthetic DICOM it writes itself, so it needs no data and can be run anywhere:
+
+  ```bash
+  python3 web/test/run_selftest.py            # headless Chrome
+  python3 web/test/run_selftest.py --serve    # any browser
+  ```
+
+Two limits worth knowing up front. A web page **cannot launch ITK-SNAP** — on
+Chrome and Edge it shares a folder with it instead, via the File System Access
+API, which gets the round trip down to two clicks; elsewhere it hands over a
+zip. And results live in **IndexedDB**, so they are per-browser and per-machine
+until you export them.
+
+The model layer is an interface (`web/lib/predictor.js`). What ships is a
+deterministic stub that draws a synthetic blob from a hash of the voxels — it
+exists so the tool can be built and tested before a model exists, and the UI
+shows a permanent banner while it is active. `OnnxPredictor` is where a real
+one goes.
 
 ## Three opinions baked in
 
@@ -139,6 +187,12 @@ The manifest builder and metadata crosswalk from the original project are **not*
 repo. They are welded to one lab's spreadsheet layout and encode specific corrections to
 unpublished data, so they wouldn't be reusable and shouldn't be public. Everything here is
 the part that generalizes.
+
+For the same reason the code here is generalized rather than copied verbatim: study
+names, animal and session identifiers, and measured volumes are stripped on the way in
+by a script that then re-reads every file and refuses to publish if a single one
+survived. If you find something that looks like it belongs to a specific study, that is
+a bug — please open an issue.
 
 ## License
 

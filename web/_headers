@@ -1,0 +1,20 @@
+# Cloudflare Pages reads this file. Netlify uses the same format. GitHub Pages
+# ignores it, which is one more reason to prefer Pages -- see README.md.
+#
+# The policy is tight because it can be: this build has no backend, loads
+# nothing from a CDN, and makes no network requests of its own once the page is
+# loaded. Anything that tries to is a bug or an attack, and connect-src 'self'
+# turns either into a visible console error rather than a silent exfiltration
+# of scan data.
+
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Cross-Origin-Opener-Policy: same-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()
+
+# style-src needs 'unsafe-inline': the page carries its stylesheet inline and
+# uses style attributes throughout. script-src does NOT, and must not -- there
+# is no inline script anywhere, and keeping it that way is what makes the
+# script-src rule worth having.

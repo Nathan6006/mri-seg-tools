@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Self-test</title>
+<style>
+  body{font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;
+       max-width:960px;margin:32px auto;padding:0 20px;color:#16191d}
+  h1{font:600 20px/1.3 system-ui,sans-serif;margin:0 0 4px}
+  .lead{font:14px/1.6 system-ui,sans-serif;color:#6b7280;margin:0 0 24px}
+  .row{display:flex;gap:10px;align-items:baseline;padding:3px 0;
+       border-bottom:1px solid #f0f1f3;flex-wrap:wrap}
+  .mark{width:1em}
+  .nm{flex:1}
+  .ms{color:#9ca3af;font-size:12px}
+  .ok{color:#15803d}
+  .bad{color:#b91c1c}
+  pre{flex-basis:100%;white-space:pre-wrap;background:#fef2f2;padding:10px;
+      border-radius:6px;font-size:12px;margin:6px 0 2px;color:#7f1d1d}
+</style>
+</head>
+<body data-state="running">
+
+<h1>Tumour review tool — self-test</h1>
+<p class="lead">Runs the whole pipeline against synthetic scans built in this
+tab: DICOM decode, geometry, NIfTI, the stub model, review scoring, storage,
+edit tracking, interpolation and export. No lab data is involved, so this is
+safe to run anywhere. Green means the build works in <em>this</em> browser —
+which is the part that cannot be checked from a terminal.</p>
+
+<div id="out">running…</div>
+
+<script type="module" src="./selftest.js"></script>
+</body>
+</html>
