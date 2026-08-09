@@ -15,3 +15,6 @@ pairs.csv
 __pycache__/
 *.pyc
 .DS_Store
+
+# Cloudflare wrangler's local cache. Holds account identifiers.
+.wrangler/
