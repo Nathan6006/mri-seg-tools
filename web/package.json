@@ -1,0 +1,6 @@
+{
+  "name": "mri-review-tool",
+  "private": true,
+  "type": "module",
+  "description": "Static build of the tumour review tool. No dependencies and no build step -- this file exists so `node` treats web/lib/*.js as ES modules when running web/test/."
+}
