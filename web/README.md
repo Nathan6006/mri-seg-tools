@@ -56,16 +56,31 @@ the page is not permitted to talk to any other host, so this is enforced rather
 than promised.
 
 Results are kept in **IndexedDB**, which is per-browser and per-machine. This
-is the real cost of having no server, and the UI says so plainly:
+is the real cost of having no server: results do not follow you to another
+computer, and clearing site data deletes them.
 
-* results do not follow you to another computer,
-* clearing site data deletes them,
-* the browser can evict them under disk pressure if it refused persistent
-  storage (the app asks on startup, and warns in the header if refused).
+### How long does that storage last?
+
+Not one answer — four, and they differ enough that the app works out which one
+applies and prints it in the header.
+
+| | How long |
+|---|---|
+| Chrome / Edge, persistence granted | **Indefinitely.** Never evicted automatically; goes only when someone clears site data. This is what the app requests on startup, and Chrome grants it silently once the site has any engagement history. |
+| Chrome / Edge, persistence refused | Until the disk gets tight, then origins are evicted least-recently-used. No warning, no time limit. |
+| **Safari** | **About 7 days.** Safari's tracking prevention deletes all script-writable storage, IndexedDB included, after seven days of browsing without visiting the page. Asking for persistence does *not* exempt you; only adding the page to the Home Screen as a web app does. |
+| Private / incognito, any browser | Gone when the window closes. |
+
+Firefox behaves like Chrome but prompts the user rather than deciding
+heuristically.
+
+The Safari row is the one that actually catches people out — a reviewer who
+comes back to a cohort a fortnight later finds it empty, with no warning and
+nothing to do about it. If the lab uses Safari, either add the page to the Home
+Screen or treat **Download all** as mandatory at the end of each session.
 
 **Download all** writes a zip you control — masks, QC images, `volumes.csv`,
-`results.json`. That is the backup, and it is worth taking at the end of a
-session.
+`results.json`. Nothing else here is a backup.
 
 ## What is different from the Flask build
 

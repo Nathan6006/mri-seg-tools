@@ -77,7 +77,12 @@ export async function init(model) {
   STATE.cases = await store.allCases();
   const p = await store.requestPersistence();
   const u = await store.usage();
-  STATE.storage = { ...p, used: u?.used ?? 0, quota: u?.quota ?? 0 };
+  STATE.storage = {
+    ...p, used: u?.used ?? 0, quota: u?.quota ?? 0,
+    // How long results actually last here, which is a per-browser policy
+    // question rather than a yes/no. See store.storagePolicy.
+    policy: store.storagePolicy(p.persisted),
+  };
   return state();
 }
 

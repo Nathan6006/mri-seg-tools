@@ -25,6 +25,11 @@ warnings.filterwarnings("ignore")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "src"))
+
+# The study data is not in this repo. Look beside it, or wherever MRI_RAW says.
+RAW = os.environ.get("MRI_RAW") or next(
+    (p for p in (os.path.join(ROOT, "raw"), os.path.join(ROOT, "..", "raw"))
+     if os.path.isdir(p)), os.path.join(ROOT, "raw"))
 from loader import find_t2_axial_series, load_series  # noqa: E402
 
 OUT = os.environ.get("PARITY_OUT",
@@ -107,7 +112,7 @@ def main() -> int:
     for row in report:
         name = row["session"]
         print(f"\n{name}")
-        session_dir = os.path.join(ROOT, "raw", name)
+        session_dir = os.path.join(RAW, name)
 
         found = find_t2_axial_series(session_dir)
         py_series = [int(os.path.basename(os.path.dirname(s))) for s in found]
