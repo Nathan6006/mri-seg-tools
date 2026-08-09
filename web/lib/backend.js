@@ -37,9 +37,14 @@ import {
 } from './pipeline.js';
 import { groupSessions } from './volume.js';
 import * as fs from './fsaccess.js';
+import * as onnx from './onnx.js';
 
 export const STATE = {
   model: null,
+  modelAvailable: false,
+  modelLoading: false,
+  modelReady: null,
+  modelError: null,
   minVoxels: 0,
   cases: [],
   storage: { supported: false, persisted: false, used: 0, quota: 0 },
@@ -73,6 +78,10 @@ const byName = (name) => STATE.cases.find((c) => c.case === name);
 
 export async function init(model) {
   STATE.model = model ?? await store.getKV('model', null);
+  // Pick up a trained model without being asked, from the cache or from one
+  // served beside the page. A reviewer should not have to know the tool has a
+  // model-loading step; they should only hear about it if there is no model.
+  await autoloadModel().catch((e) => { STATE.modelError = e.message; });
   STATE.minVoxels = await store.getKV('minVoxels', 0);
   STATE.cases = await store.allCases();
   const p = await store.requestPersistence();
@@ -91,11 +100,89 @@ export function state() {
   return {
     model: pred.name,
     model_is_real: pred.isReal,
+    model_info: onnx.activeModelInfo(),
+    model_available: STATE.modelAvailable,
+    model_loading: STATE.modelLoading,
+    model_error: STATE.modelError || null,
     min_voxels: STATE.minVoxels,
     storage: STATE.storage,
     cases: STATE.cases,
     job: STATE.job,
   };
+}
+
+// ---------------------------------------------------------------------------
+// The trained model
+// ---------------------------------------------------------------------------
+
+/**
+ * Load a model from the cache or from the site, and switch to it.
+ *
+ * Deliberately silent when there is nothing to load: a build published without
+ * weights is a supported configuration, not an error. The tool falls back to
+ * the stub and the banner says so.
+ */
+export async function autoloadModel() {
+  const chosen = STATE.model;                 // what the user last picked, if anything
+  const bundle = await onnx.autoloadBundle();
+  STATE.modelAvailable = !!bundle;
+  if (!bundle) return null;
+
+  // Default to the trained model, but never override a deliberate choice. The
+  // first version of this reset the setting on every reload, which quietly
+  // undid "use the stub" and "no mirroring" every time the page was opened.
+  if (!chosen) {
+    STATE.model = 'onnx';
+    await store.setKV('model', 'onnx');
+  }
+
+  // Building the session takes a couple of seconds. Doing it before the first
+  // paint would make the app look broken on startup, and there is nothing to
+  // run it on until the user has loaded some scans anyway -- so it warms up in
+  // the background and `activeModel()` waits for it if a run gets there first.
+  STATE.modelLoading = true;
+  STATE.modelReady = onnx.setActiveBundle(bundle)
+    .then(() => { STATE.modelLoading = false; STATE.modelError = null; })
+    .catch((e) => { STATE.modelLoading = false; STATE.modelError = e.message; });
+  return STATE.modelReady;
+}
+
+/** Resolves when the model has finished starting (or failed to). */
+export async function modelReady() {
+  if (STATE.modelReady) await STATE.modelReady;
+  return state();
+}
+
+/** Load a model from files the user picked, for when it is not served. */
+export async function loadModelFromFiles(files) {
+  const bundle = await onnx.bundleFromFiles(files);
+  await onnx.cacheBundle(bundle);
+  await onnx.setActiveBundle(bundle);
+  STATE.modelAvailable = true;
+  STATE.modelError = null;
+  STATE.model = 'onnx';
+  await store.setKV('model', 'onnx');
+  return onnx.activeModelInfo();
+}
+
+/** Choose between the trained model, the same without mirroring, and the stub. */
+export async function setModel(spec) {
+  getPredictor(spec);                      // throws on an unknown spec
+  if (spec.startsWith('onnx') && !await onnx.activeModel()) {
+    throw new Error('there is no model loaded to switch to');
+  }
+  STATE.model = spec;
+  await store.setKV('model', spec);
+  return state();
+}
+
+export async function forgetModel() {
+  await onnx.clearCachedBundle();
+  onnx.forgetActiveModel();
+  STATE.modelAvailable = false;
+  STATE.model = 'stub';
+  await store.setKV('model', 'stub');
+  return state();
 }
 
 async function refreshStorage() {

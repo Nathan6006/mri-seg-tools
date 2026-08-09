@@ -365,6 +365,29 @@
   </div>
 
   <div class="card">
+    <h2>Model</h2>
+    <p class="hint" id="modelState">Checking…</p>
+    <div class="row" style="margin-top:10px">
+      <select id="modelPick" class="grow" style="font-size:12px;padding:4px 8px">
+        <option value="onnx">Trained model (with test-time mirroring)</option>
+        <option value="onnx:no-tta">Trained model — no mirroring (about 4× faster)</option>
+        <option value="stub">Stub (synthetic masks, for testing the tool)</option>
+      </select>
+    </div>
+    <!-- webkitdirectory, so the whole model folder arrives in one go. Picking
+         the shards individually is possible but there are five of them and the
+         manifest has to come too. -->
+    <input type="file" id="modelPicker" webkitdirectory directory multiple hidden>
+    <div class="row" style="margin-top:10px">
+      <button id="btnLoadModel">Load model from a folder…</button>
+      <button id="btnForgetModel" class="ghost" style="color:var(--bad)">Forget</button>
+    </div>
+    <p class="hint" style="margin-top:10px">The model is downloaded once and
+      kept in this browser. It never leaves your machine, and neither do the
+      scans it runs on.</p>
+  </div>
+
+  <div class="card">
     <h2>Already segmented something?</h2>
     <p class="hint">Results are kept in this browser, on this machine. Reopen
       them without re-running anything.</p>

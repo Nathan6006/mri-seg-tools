@@ -107,11 +107,22 @@ API, which gets the round trip down to two clicks; elsewhere it hands over a
 zip. And results live in **IndexedDB**, so they are per-browser and per-machine
 until you export them.
 
-The model layer is an interface (`web/lib/predictor.js`). What ships is a
-deterministic stub that draws a synthetic blob from a hash of the voxels — it
-exists so the tool can be built and tested before a model exists, and the UI
-shows a permanent banner while it is active. `OnnxPredictor` is where a real
-one goes.
+A trained network runs **in the tab**, as ONNX under onnxruntime-web — WebGPU
+where it is available, WebAssembly everywhere else. Weights are not in this
+repo: they are a derivative of whatever imaging they were trained on, so
+publishing them is the data owner's call, not a build step's. The tool loads
+them from `web/model/` if a deployment serves it, or from a folder the user
+picks; with neither it falls back to a deterministic stub and shows a permanent
+banner saying the masks are synthetic.
+
+The preprocessing around the network — normalise, pad, mirror, argmax — is the
+part that can be silently wrong, so it is written twice and cross-checked.
+`web/test/run_onnx_parity.py` drives real scans through the browser and
+compares them voxel by voxel against masks produced outside it. **On the CPU
+backend the browser is exact.** The GPU backend differs by a handful of
+boundary voxels, which is half-precision arithmetic rather than a defect — so
+for numbers that go in a paper, use the command-line pipeline, which is
+deterministic.
 
 ## Three opinions baked in
 

@@ -8,13 +8,32 @@
 # of scan data.
 
 /*
-  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer
   Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
   Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()
 
 # style-src needs 'unsafe-inline': the page carries its stylesheet inline and
 # uses style attributes throughout. script-src does NOT, and must not -- there
 # is no inline script anywhere, and keeping it that way is what makes the
 # script-src rule worth having.
+#
+# THE THREE ADDITIONS FOR RUNNING THE MODEL
+#
+# 'wasm-unsafe-eval' lets the page compile WebAssembly. The name is alarming and
+# the permission is not: it allows WASM compilation only, and specifically does
+# NOT re-enable eval() or inline script. Without it the inference runtime cannot
+# start at all. It is the narrow keyword that exists precisely so pages like
+# this do not have to ask for 'unsafe-eval'.
+#
+# worker-src blob: lets the runtime start its worker threads, which it creates
+# from a generated blob rather than a file on disk.
+#
+# COEP: require-corp, together with the COOP line above, makes the page
+# cross-origin isolated, which is the precondition for SharedArrayBuffer and so
+# for multi-threaded inference. It costs nothing here because the page already
+# loads every byte from its own origin -- there is no third-party resource for
+# it to break. If inference silently drops to a single thread after a hosting
+# change, check that both of these still arrive.

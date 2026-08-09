@@ -19,13 +19,19 @@ secure context. Serve the folder instead:
 
 ```bash
 cd <the repo root>
-python3 -m http.server 8000 --directory web
-# then open http://localhost:8000
+python3 web/serve.py           # then open http://localhost:8000
 ```
 
-`localhost` counts as a secure context, so everything works. Any static server
-does — `npx serve web`, `caddy file-server`, whatever is to hand. There is no
-build step and no dependencies: the files you edit are the files that run.
+`localhost` counts as a secure context, so everything works. There is no build
+step and no dependencies: the files you edit are the files that run.
+
+`python3 -m http.server 8000 --directory web` also works for clicking around,
+but it cannot send headers, and two of the ones in `_headers` change how the
+tool behaves. Without COOP/COEP the page is not cross-origin isolated, so
+inference drops to a single thread and a scan that takes seconds takes minutes;
+and the Content-Security-Policy — the thing that proves the page cannot phone
+home — never gets exercised until production. `serve.py` sends both, so testing
+locally means something.
 
 ## Deploying it
 
@@ -145,20 +151,90 @@ moved elsewhere. Two notes from that testing:
 
 ## The model
 
-Still `StubPredictor`, and the orange banner says so. **The stub's masks are
-synthetic** — derived from a hash of the voxels, unrelated to where the tumour
-is. They exist so the tool can be built and tested before a model exists.
+A trained network runs **in the tab**, as ONNX under onnxruntime-web. Nothing
+is uploaded to run it and no server is involved: the weights come down once,
+and every scan after that is segmented locally.
 
-Note that the web stub and the Python stub draw *different* fake tumours for
-the same scan. The hash inputs are identical and the voxel decode is verified
+### Where the weights come from
+
+`model/` is not in this repo. Trained weights are a derivative of whatever
+imaging they were trained on, so publishing them is a decision for the owner of
+that data, not something a build step should do quietly. The tool therefore
+looks in two places, in order:
+
+1. **`model/` served beside the page.** If it is there, it is fetched on first
+   load and cached; nothing else is needed.
+2. **A folder the user picks**, via *Load model from a folder…*. Same files,
+   same checks, cached the same way.
+
+With neither, the tool falls back to `StubPredictor` and shows the orange
+banner. That is a supported configuration, not a broken one — the viewer and
+the whole editor work without a model.
+
+A bundle is `manifest.json`, `model.onnx` and numbered `weights-NNN.bin`
+shards. The weights are split because static hosts cap individual files
+(Cloudflare Pages at 25 MB); the split is on raw bytes, and the manifest
+carries a SHA-256 of the whole thing, which is checked after the shards are
+rejoined. A truncated download fails loudly instead of loading a corrupted
+model.
+
+### What runs around the network
+
+`lib/onnx.js` does the preprocessing, and it is short on purpose:
+
+```
+z-score over the whole volume → centre-pad each slice to the patch →
+network → average logits over the mirrorings → softmax → argmax → un-pad
+```
+
+Normalisation is over the **whole stack**, not per slice. Mirrored predictions
+are averaged as **logits**, not probabilities, because that is what the
+training framework does and the two differ by a handful of boundary voxels.
+
+There is no resampling and no cropping, and that is checked rather than
+assumed: the exporter refuses to write a model unless every image is already at
+the configuration's target spacing and crop-to-nonzero crops nothing. The
+manifest records both as `false`, and `assertCompatible` refuses to run a model
+that needs either. Otherwise a future model would silently segment a
+differently-shaped image.
+
+### Speed, and the two backends
+
+WebGPU where it is available (Chrome and Edge), WebAssembly everywhere else,
+chosen automatically. On this hardware, a 18-slice scan with test-time
+mirroring:
+
+| backend | per scan | agreement with the reference |
+|---|---|---|
+| WebGPU | ~2.4 s | a few voxels differ (half-precision GPU arithmetic) |
+| WebAssembly | ~21 s | **exact, 0 voxels** |
+
+The CPU path being bit-exact is what proves the wrapper is right. The GPU path
+computes in half precision with a different accumulation order, so a handful of
+voxels on the decision boundary land differently — arithmetic, not a defect,
+and far below anything that could matter. **For a number that goes in a paper,
+use the command-line pipeline, which is deterministic.**
+
+Multi-threading needs the page to be cross-origin isolated (COOP + COEP). It
+still runs without that, on one thread and several times slower, which is why
+`serve.py` sends the same headers the real host does.
+
+*Test-time mirroring* can be turned off in the model picker. It is four network
+passes per slice instead of one, so it is roughly 4× faster without — a real
+trade, and one that belongs to the person waiting rather than to the code.
+
+### The stub
+
+Still there, and still what runs when no model is loaded. **The stub's masks
+are synthetic** — derived from a hash of the voxels, unrelated to where the
+tumour is.
+
+The web stub and the Python stub draw *different* fake tumours for the same
+scan. The hash inputs are identical and the voxel decode is verified
 bit-identical, but the two use different random number generators, and
 reproducing numpy's PCG64 in JavaScript would make two throwaway fake models
 agree while proving nothing. What has to agree between the two tools is the
-geometry, the voxels and the mm³, and that is tested directly (see below).
-
-When fold 0 is trained, `OnnxPredictor` in `lib/predictor.js` is the place it
-goes — export the checkpoint to ONNX and run it with onnxruntime-web. Nothing
-outside that file changes.
+geometry, the voxels and the mm³, and that is tested directly.
 
 ## Tests
 
@@ -187,10 +263,27 @@ end, including the parts node cannot run — IndexedDB, canvas, the real
 .venv/bin/python web/test/run_selftest.py --serve    # open it in any browser
 ```
 
-34 checks, from gzip to zip export. It builds its own DICOM files
+41 checks, from gzip to zip export. It builds its own DICOM files
 (`test/fixture.js`) so it involves no lab data and is safe to run anywhere —
 including with `--serve` on the machine of anyone who wants to know whether
 their browser is supported.
+
+**The model, against the reference implementation.** The one that matters for
+running a network client-side — the network itself behaves the same everywhere,
+but the wrapper around it can be wrong in ways that produce a confident mask in
+slightly the wrong place:
+
+```bash
+.venv/bin/python web/test/run_onnx_parity.py \
+    --images <dir of *_0000.nii.gz> --masks <dir of reference masks> --cases 3
+.venv/bin/python web/test/run_onnx_parity.py ... --backend wasm    # must be exact
+```
+
+It runs real scans through `lib/onnx.js` in a real browser and compares voxel
+by voxel against masks produced outside the browser. The CPU backend is
+required to match exactly; the GPU backend gets a small allowance for
+half-precision arithmetic. The fixtures are real images and are not in this
+repo — they are staged into a temporary folder and served to loopback only.
 
 The fixture deliberately writes `InstanceNumber` running *opposite* to +z,
 which is how the real scanner writes it. A fixture where the two agreed would
@@ -204,6 +297,9 @@ web/
 ├── index.html          the page: markup and styles
 ├── app.js              the viewer, editor and review flow
 ├── _headers            CSP and friends, for Cloudflare Pages
+├── serve.py            a local server that sends those same headers
+├── vendor/             onnxruntime-web, self-hosted (no CDN)
+├── model/              the trained weights — NOT in this repo, see "The model"
 └── lib/
     ├── dicom.js        DICOM parser, this scanner's dialect only
     ├── volume.js       series -> volume, and the geometry rules
@@ -212,6 +308,7 @@ web/
     ├── edt.js          exact distance transform, for interpolation
     ├── label.js        6-connected components
     ├── predictor.js    StubPredictor, review priority, OnnxPredictor
+    ├── onnx.js         the trained model: loading, preprocessing, inference
     ├── qc.js           the slice montage
     ├── pipeline.js     port of src/batch.py
     ├── store.js        IndexedDB

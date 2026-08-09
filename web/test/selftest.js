@@ -616,18 +616,146 @@ export async function run() {
     }
   });
 
-  await check('the stub banner is shown while the model is not real', async () => {
+  /**
+   * The banner has to track which model is actually running.
+   *
+   * This used to assert only that the banner was visible, because the stub was
+   * the only thing there was. Now a build can ship with real weights, and the
+   * check that matters is the pairing: synthetic masks must be labelled, and
+   * real ones must not be -- a banner crying "STUB" over genuine predictions
+   * teaches people to ignore it, which costs more than having no banner at all.
+   */
+  await check('the banner says stub only when the model really is a stub', async () => {
     const { frame, errors } = await loadApp();
     try {
       if (errors.length) throw new Error(errors.join(' | '));
-      const banner = frame.contentDocument.getElementById('stubBanner');
-      eq(banner.style.display, 'block', 'stub banner visible');
-      truthy(banner.textContent.includes('STUB MODEL'), 'banner text');
-      truthy(banner.textContent.includes('Do not record these volumes'),
-             'banner says not to record the volumes');
+      const doc = frame.contentDocument;
+      const banner = doc.getElementById('stubBanner');
+      const card = doc.getElementById('modelState');
+
+      // Starting a model session takes a moment, so the card is briefly
+      // "loading". Wait for it to settle rather than read it mid-flight.
+      const t0 = performance.now();
+      while (card.dataset.state === 'loading' && performance.now() - t0 < 20000) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const real = card.dataset.state === 'loaded';
+
+      // Without this the check is vacuous: both branches pass, so a build where
+      // the model silently failed to start would look identical to one that was
+      // published without weights on purpose. If a model IS being served, it
+      // has to have loaded.
+      const onnx = await import('../lib/onnx.js');
+      const served = await onnx.servedModelManifest('../model/');
+      if (served) {
+        eq(card.dataset.state, 'loaded',
+           `a model is served at model/ (version ${served.version}) so it must load; ` +
+           `the card says "${card.textContent.trim().slice(0, 120)}"`);
+      }
+
+      if (real) {
+        eq(banner.style.display, 'none',
+           'banner hidden while a trained model is loaded');
+        truthy(doc.getElementById('modelState').textContent
+                  .includes('Trained model loaded'),
+               'the model card says a trained model is loaded');
+      } else {
+        eq(banner.style.display, 'block', 'stub banner visible');
+        truthy(banner.textContent.includes('STUB MODEL'), 'banner text');
+        truthy(banner.textContent.includes('Do not record these volumes'),
+               'banner says not to record the volumes');
+      }
     } finally {
       frame.remove();
     }
+  });
+
+  /**
+   * The adapter between the app and the model, end to end.
+   *
+   * The dedicated parity test drives `OnnxModel.segment` directly against real
+   * scans; what it does not touch is `OnnxPredictor`, which is what the app
+   * actually calls -- and that is where the outputs get wrapped back onto the
+   * scan's grid. Getting that wrong would put a correctly-computed mask on the
+   * wrong geometry, which is the expensive kind of bug.
+   *
+   * The mask itself is meaningless here: the fixture is a synthetic gradient,
+   * not anatomy. Shapes, grid and value range are the point.
+   */
+  await check('the trained model returns mask and probability on the scan grid',
+    async () => {
+      const onnx = await import('../lib/onnx.js');
+      const served = await onnx.servedModelManifest('../model/');
+      if (!served) return;                  // published without weights: nothing to check
+      if (!await onnx.activeModel()) {
+        await onnx.setActiveBundle(await onnx.fetchBundle(served, '../model/'));
+      }
+      const pred = getPredictor('onnx');
+      truthy(pred.isReal, 'the ONNX predictor reports itself as a real model');
+      const { mask, prob } = await pred.predict(vol);
+
+      eq(mask.nx, vol.nx, 'mask nx'); eq(mask.ny, vol.ny, 'mask ny');
+      eq(mask.nz, vol.nz, 'mask nz');
+      arrClose(mask.spacing, vol.spacing, 1e-12, 'mask spacing');
+      arrClose(mask.origin, vol.origin, 1e-12, 'mask origin');
+      arrClose(mask.direction, vol.direction, 1e-12, 'mask direction');
+      eq(mask.data.length, vol.length, 'mask voxel count');
+      eq(prob.data.length, vol.length, 'probability voxel count');
+
+      for (let i = 0; i < mask.data.length; i++) {
+        if (mask.data[i] !== 0 && mask.data[i] !== 1) {
+          throw new Error(`mask voxel ${i} is ${mask.data[i]}, expected 0 or 1`);
+        }
+        if (!(prob.data[i] >= 0 && prob.data[i] <= 1)) {
+          throw new Error(`probability voxel ${i} is ${prob.data[i]}, outside [0,1]`);
+        }
+      }
+      // The label must be the argmax of the two logits, which for two classes
+      // is the same as thresholding the softmax at a half. If these ever
+      // disagree the two are being derived from different things.
+      for (let i = 0; i < mask.data.length; i++) {
+        if (mask.data[i] !== (prob.data[i] > 0.5 ? 1 : 0) && prob.data[i] !== 0.5) {
+          throw new Error(`voxel ${i}: label ${mask.data[i]} disagrees with ` +
+                          `probability ${prob.data[i]}`);
+        }
+      }
+    });
+
+  await check('a model bundle is rejected if its weights do not match the manifest',
+    async () => {
+      const onnx = await import('../lib/onnx.js');
+      const bytes = new Uint8Array(64).fill(7);
+      const manifest = {
+        version: 'x', graph: 'model.onnx', weights_path: 'w.data',
+        weights_bytes: 64, shards: [{ name: 'weights-000.bin', bytes: 64 }],
+        // Deliberately not the digest of `bytes`.
+        weights_sha256: '0'.repeat(64),
+      };
+      const files = [
+        new File([JSON.stringify(manifest)], 'manifest.json'),
+        new File([new Uint8Array(8)], 'model.onnx'),
+        new File([bytes], 'weights-000.bin'),
+      ];
+      await throws(() => onnx.bundleFromFiles(files), 'checksum',
+                   'a corrupted download must not be loaded as a model');
+    });
+
+  await check('a model folder missing a shard is refused by name', async () => {
+    const onnx = await import('../lib/onnx.js');
+    const manifest = {
+      version: 'x', graph: 'model.onnx', weights_path: 'w.data',
+      weights_bytes: 64,
+      shards: [{ name: 'weights-000.bin', bytes: 32 },
+               { name: 'weights-001.bin', bytes: 32 }],
+      weights_sha256: '0'.repeat(64),
+    };
+    const files = [
+      new File([JSON.stringify(manifest)], 'manifest.json'),
+      new File([new Uint8Array(8)], 'model.onnx'),
+      new File([new Uint8Array(32)], 'weights-000.bin'),
+    ];
+    await throws(() => onnx.bundleFromFiles(files), 'weights-001.bin',
+                 'the missing shard is named, not just "failed"');
   });
 
   await check('cleanup leaves no cases behind', async () => {
