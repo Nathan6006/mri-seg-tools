@@ -310,40 +310,38 @@ export class StubPredictor extends Predictor {
 }
 
 /**
- * The real thing, once there is one. Not usable yet.
+ * The trained network, run in the tab.
  *
- * The browser route is ONNX rather than nnU-Net's Python inference: export the
- * trained fold with `nnUNetv2_export_model_to_onnx` (or torch.onnx on the
- * loaded trainer), then run it here with onnxruntime-web. That is not written
- * yet because there is no checkpoint to export -- fold 0 is training now.
+ * All of the actual work -- loading the weights, normalising, padding,
+ * mirroring, argmax -- is in `onnx.js`, which is where it can be checked
+ * against the Python reference implementation. This class is only the adapter
+ * that makes it look like every other predictor, so that nothing else in the
+ * tool has to know which kind is running.
  *
- * What this class will have to do, and none of it touches the rest of the tool:
- *
- *   1. Normalise the way nnU-Net's plan says. For this dataset that is
- *      z-score per image (the fingerprint chose ZScoreNormalization), NOT the
- *      CT window/level path.
- *   2. Feed the whole volume in one go. nnU-Net planned a [20, 256, 256] patch
- *      for 3d_fullres against an 18 x 256 x 248 scan, so a patch covers the
- *      entire stack and there is no sliding window -- except on the six
- *      sessions with 20-30 slices, which do need one.
- *   3. Take channel 1 of the softmax as `prob`, threshold at 0.5 for `mask`,
- *      and return both on the input grid untouched. Do not resample: the plan
- *      keeps the native 1.10 mm through-plane spacing.
+ * The model is registered once (see `onnx.setActiveBundle`) rather than passed
+ * in, because loading it is a slow, user-visible, once-per-machine step and the
+ * predictor is constructed fresh on every run.
  */
 export class OnnxPredictor extends Predictor {
-  constructor(modelUrl) {
+  constructor(opts = {}) {
     super();
-    this.modelUrl = modelUrl;
-    this.name = `onnx:${(modelUrl || '').split('/').pop()}`;
+    this.tta = opts.tta !== false;
+    this.name = 'onnx';
     this.isReal = true;
   }
 
-  async predict(_vol) {
-    throw new Error(
-      'OnnxPredictor is a placeholder until fold 0 has been trained and ' +
-      'exported. Until then the tool runs on StubPredictor, and the orange ' +
-      'banner in the UI says so. See the class comment for what wiring it up ' +
-      'involves -- nothing outside this file changes.');
+  async predict(vol, opts = {}) {
+    const onnx = await import('./onnx.js');
+    const model = await onnx.activeModel();
+    if (!model) {
+      throw new Error('no model is loaded. Load one in Settings, or the tool ' +
+                      'will keep running on the stub.');
+    }
+    this.name = `onnx:${model.manifest.version} (${model.backend})`;
+    const { prob, mask } = await model.segment(vol, {
+      tta: this.tta, onProgress: opts.onProgress,
+    });
+    return { mask: vol.withData(mask), prob: vol.withData(prob) };
   }
 }
 
@@ -353,12 +351,15 @@ export class OnnxPredictor extends Predictor {
  *     null / "stub"     the varied deterministic fake
  *     "stub:empty"      always predicts tumour-free
  *     "stub:sphere"     one fixed centred blob, for exact assertions
- *     <a URL>           an ONNX model to fetch
+ *     "onnx"            the trained model, if one has been loaded
+ *     "onnx:no-tta"     the same, without test-time mirroring (about 4x faster)
  */
 export function getPredictor(spec) {
   if (spec == null || spec === 'stub') return new StubPredictor('varied');
   if (spec.startsWith('stub:')) return new StubPredictor(spec.slice(5));
-  return new OnnxPredictor(spec);
+  if (spec === 'onnx') return new OnnxPredictor();
+  if (spec === 'onnx:no-tta') return new OnnxPredictor({ tta: false });
+  throw new Error(`unknown model ${JSON.stringify(spec)}`);
 }
 
 export { removeSmallComponents };

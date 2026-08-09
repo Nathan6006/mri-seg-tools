@@ -266,6 +266,8 @@ async function refresh(){
       + `They are not real predictions. Do not record these volumes.`;
   } else b.style.display='none';
 
+  renderModelCard();
+
   const has = STATE.cases.length>0;
   $('#main').style.display = has ? 'grid' : 'none';
   $('#setup').style.display = has ? 'none' : 'block';
@@ -1808,6 +1810,97 @@ $('#btnReload').onclick = async () => {
   }catch(e){ toast(e.message, true); }
 };
 
+/* ======================= the model =======================
+   Three states worth telling apart, because they mean very different things
+   for whether a number on screen can be written down:
+
+     a trained model is loaded    -- real predictions
+     no model is available        -- the stub, and the banner says so
+     a model exists but failed    -- also the stub, but for a reason the user
+                                     can act on, so the reason is shown
+
+   The picker also offers the trained model without test-time mirroring. That
+   is a real speed/accuracy trade (four network passes per slice instead of
+   one) and it belongs to the person waiting, not to the code. */
+function renderModelCard(){
+  const el = $('#modelState'); if(!el) return;
+  const info = STATE.model_info;
+  const pick = $('#modelPick');
+
+  // `data-state` is the signal the self-test waits on. The card passes through
+  // "loading" on every startup, and a test that read the text at the wrong
+  // moment would be flaky in a way that looks like a real failure.
+  el.dataset.state = info ? 'loaded'
+    : STATE.model_loading ? 'loading'
+    : STATE.model_error ? 'error' : 'none';
+
+  if(STATE.model_loading && !info){
+    el.innerHTML = 'Starting the model…';
+  } else if(info){
+    const mb = (info.bytes/1e6).toFixed(0);
+    const backend = info.backend === 'webgpu'
+      ? 'running on the GPU (WebGPU)'
+      : 'running on the CPU (WebAssembly) — slower; Chrome or Edge will use the GPU';
+    el.innerHTML = `<strong style="color:var(--ok)">Trained model loaded.</strong> `
+      + `${info.precision}, ${mb} MB, ${backend}.`
+      + (info.trainer ? ` <span class="meta">${info.trainer}, fold ${info.fold},`
+                      + ` epoch ${info.epoch}.</span>` : '');
+  } else if(STATE.model_error){
+    el.innerHTML = `<strong style="color:var(--bad)">The model could not be `
+      + `loaded.</strong> ${STATE.model_error}`;
+  } else {
+    el.innerHTML = `<strong>No trained model is loaded</strong>, so the tool is `
+      + `running on the stub and its masks are synthetic. Load a model folder `
+      + `to get real predictions.`;
+  }
+  if(pick && STATE.model) {
+    const v = STATE.model.startsWith('onnx')
+      ? (STATE.model.includes('no-tta') ? 'onnx:no-tta' : 'onnx') : 'stub';
+    pick.value = v;
+    // Offering the trained model when none is loaded would just throw on the
+    // next run. Disable rather than let it be picked.
+    for(const o of pick.options) if(o.value.startsWith('onnx')) o.disabled = !info;
+  }
+  const forget = $('#btnForgetModel');
+  if(forget) forget.style.display = info ? '' : 'none';
+}
+
+$('#modelPick').onchange = async e => {
+  try{ STATE = await Backend.setModel(e.target.value); refresh(); }
+  catch(err){ toast(err.message, true); renderModelCard(); }
+};
+
+$('#btnLoadModel').onclick = () => $('#modelPicker').click();
+
+$('#modelPicker').onchange = async e => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  if(!files.length) return;
+  const el = $('#modelState');
+  el.innerHTML = 'Reading and checking the model…';
+  try{
+    // Joining ~67 MB of shards and verifying the checksum takes a moment, and
+    // starting the runtime takes a few seconds more. Say so rather than look
+    // frozen.
+    const info = await Backend.loadModelFromFiles(files);
+    STATE = Backend.state();
+    refresh();
+    toast(`Loaded the trained model (${(info.bytes/1e6).toFixed(0)} MB, ${info.backend})`);
+  }catch(err){
+    toast(err.message, true);
+    STATE = Backend.state();
+    renderModelCard();
+  }
+};
+
+$('#btnForgetModel').onclick = async () => {
+  if(!confirm('Remove the downloaded model from this browser? '
+            + 'The tool will fall back to the stub until you load one again.')) return;
+  STATE = await Backend.forgetModel();
+  refresh();
+  toast('Model removed from this browser');
+};
+
 /* There is no undo and, unless a bundle was downloaded, no copy anywhere else.
    So this asks for the word rather than an OK button -- a confirm() dialog is
    one stray Enter away from deleting a week of review. */
@@ -2043,6 +2136,9 @@ function unsupported(){
     await Backend.init();
     await refreshFolder();
     await refresh();
+    // The model finishes starting a second or two later. Re-render then, so
+    // the card stops saying "Starting…" without the user having to click.
+    Backend.modelReady().then(s => { STATE = s; renderModelCard(); });
   }catch(e){
     console.error(e);
     toast(e.message, true);

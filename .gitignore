@@ -18,3 +18,9 @@ __pycache__/
 
 # Cloudflare wrangler's local cache. Holds account identifiers.
 .wrangler/
+
+# The trained weights are a derivative of unpublished study data, so they are
+# not published with the tool by default. `bundle_web_model.py` writes them
+# here for local use and for a deploy; whether they go on a public URL is the
+# data owner's decision, not a build-step side effect.
+web/model/
