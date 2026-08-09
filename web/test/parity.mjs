@@ -18,6 +18,7 @@
 import { readdir, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
 import { findT2AxialSeries, loadSeries, groupSessions } from '../lib/volume.js';
@@ -26,7 +27,12 @@ import { signedDistance } from '../lib/edt.js';
 import { connectedComponents } from '../lib/label.js';
 
 const ROOT = resolve(import.meta.dirname, '../..');
-const RAW = join(ROOT, 'raw');
+// The study data is not in this repo and never will be. Look for it beside the
+// repo, or wherever MRI_RAW points. Without it this half of the test has
+// nothing to read -- which is the normal state for anyone who is not the lab.
+const RAW = process.env.MRI_RAW
+  || [join(ROOT, 'raw'), join(ROOT, '..', 'raw')].find((p) => existsSync(p))
+  || join(ROOT, 'raw');
 // Scratch, not output: this holds a few hundred MB of converted scans while the
 // python half compares them, and they are regenerable in seconds. Override with
 // PARITY_OUT if the temp directory is small.
@@ -60,6 +66,17 @@ function range(a) {
 }
 
 async function main() {
+  if (!existsSync(RAW)) {
+    console.error(
+      `No study data at ${RAW}.\n\n` +
+      `This half of the test reads real scans and compares them against ` +
+      `SimpleITK.\nIt needs the raw DICOM tree, which is not in this repo. ` +
+      `Point MRI_RAW at it,\nor run the browser self-test instead, which ` +
+      `builds its own synthetic DICOM:\n\n` +
+      `    python3 web/test/run_selftest.py\n`);
+    process.exit(2);
+  }
+
   let sessions = process.argv.slice(2);
 
   // `--sweep N` samples N sessions evenly across raw/. Passing them on the

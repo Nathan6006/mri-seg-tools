@@ -245,16 +245,17 @@ async function refresh(){
   $('#hdrMeta').textContent = `${STATE.cases.length} scans`;
 
   const s = STATE.storage;
-  $('#outDirLabel').textContent = STATE.cases.length
-    ? `Stored in this browser: ${humanBytes(s.used)} used`
+  const pol = s.policy || {};
+  $('#outDirLabel').innerHTML = STATE.cases.length
+    ? `Stored in this browser: ${humanBytes(s.used)} used · kept `
+      + `<strong>${pol.lifetime || 'until cleared'}</strong>`
     : 'Nothing stored in this browser yet';
-  // A browser that refused persistent storage can evict this origin when the
-  // disk fills. Someone three hours into reviewing a cohort should hear about
-  // that before it happens, not after.
-  setStorageWarning(s.supported && !s.persisted && STATE.cases.length
-    ? 'This browser has <strong>not</strong> granted persistent storage, so '
-      + 'results here can be cleared automatically if the disk gets full. '
-      + 'Use <strong>Download all</strong> to keep a copy you control.'
+  // How long results survive is a per-browser policy, and the answers differ by
+  // a lot -- indefinitely on Chrome with persistence, seven days on Safari
+  // whatever you do. Someone three hours into reviewing a cohort should hear
+  // which one applies to them before it matters, not after.
+  setStorageWarning(pol.level === 'warn' && STATE.cases.length
+    ? `Results here are kept <strong>${pol.lifetime}</strong>. ${pol.note}`
     : null);
 
   const b = $('#stubBanner');

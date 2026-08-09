@@ -173,3 +173,68 @@ export async function usage() {
   const { usage: used, quota } = await navigator.storage.estimate();
   return { used, quota };
 }
+
+/**
+ * HOW LONG DOES ANY OF THIS ACTUALLY LAST?
+ *
+ * It is not one answer, it is four, and the differences are large enough that
+ * the tool has to say which one applies rather than a generic "stored locally".
+ *
+ *   Chrome / Edge, persistence granted
+ *       Indefinite. Never evicted automatically; goes only when someone clears
+ *       site data. This is what the app asks for on startup, and Chrome grants
+ *       it silently once the site has any engagement history.
+ *
+ *   Chrome / Edge, persistence refused ("best-effort")
+ *       Kept until the disk gets tight, then origins are evicted
+ *       least-recently-used. No warning, no time limit.
+ *
+ *   Safari
+ *       SEVEN DAYS. Safari's tracking prevention deletes all script-writable
+ *       storage -- IndexedDB included -- after seven days of browsing without
+ *       the user visiting the site. It is not about disk pressure and asking
+ *       for persistence does not exempt you; only adding the page to the Home
+ *       Screen as a web app does. For a lab where someone reviews a cohort
+ *       every couple of weeks, this is the case that actually bites.
+ *
+ *   Private / incognito window, any browser
+ *       Gone when the window closes.
+ *
+ * Firefox behaves like Chrome but prompts the user for persistence rather than
+ * deciding heuristically.
+ *
+ * Detecting Safari from the user agent is normally a bad idea, and it is the
+ * right one here: this is a storage POLICY difference, not a missing feature,
+ * so there is nothing to feature-detect. Getting it wrong is cheap in both
+ * directions -- an unnecessary warning, or a missing one about a real risk.
+ */
+export function storagePolicy(persisted) {
+  const ua = navigator.userAgent;
+  const isSafari = /^((?!chrome|chromium|android|crios|fxios|edg).)*safari/i.test(ua);
+
+  if (isSafari) {
+    return {
+      level: 'warn',
+      lifetime: 'about 7 days without opening this page',
+      note: 'Safari deletes site storage after seven days of not visiting a ' +
+            'page, whatever permissions it has been given. Download a copy ' +
+            'before you leave results for more than a few days — or use ' +
+            'Chrome, where they persist indefinitely.',
+    };
+  }
+  if (persisted) {
+    return {
+      level: 'ok',
+      lifetime: 'indefinitely, until you clear site data',
+      note: 'This browser has granted persistent storage, so results are not ' +
+            'evicted automatically.',
+    };
+  }
+  return {
+    level: 'warn',
+    lifetime: 'until this disk runs low on space',
+    note: 'This browser has not granted persistent storage, so results here ' +
+          'can be cleared automatically if the disk gets full. Use ' +
+          '"Download all" to keep a copy you control.',
+  };
+}

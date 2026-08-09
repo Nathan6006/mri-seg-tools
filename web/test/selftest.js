@@ -496,6 +496,26 @@ export async function run() {
     eq(c.corrected_at, '2026-01-02T03:04:05', 'corrected_at came from the file, not now');
   });
 
+  await check('the storage lifetime is stated, not left vague', async () => {
+    const s = Backend.state().storage;
+    truthy(s.policy, 'a policy was worked out');
+    truthy(['ok', 'warn'].includes(s.policy.level), 'level is ok or warn');
+    truthy(s.policy.lifetime && s.policy.lifetime.length > 5,
+           `lifetime reads as a duration (got ${JSON.stringify(s.policy.lifetime)})`);
+    // Safari's seven-day rule is the one that actually catches people out, so
+    // check it is reachable rather than only ever reporting the happy answer.
+    const safari = store.storagePolicy(true);
+    const isSafariHere = /^((?!chrome|chromium|android|crios|fxios|edg).)*safari/i
+      .test(navigator.userAgent);
+    if (isSafariHere) {
+      eq(safari.level, 'warn', 'Safari warns even when persistence is granted');
+      truthy(safari.note.includes('seven days'), 'Safari note names the limit');
+    } else {
+      eq(safari.level, 'ok', 'a granted non-Safari browser is not warned at');
+      eq(store.storagePolicy(false).level, 'warn', 'a refusal is warned at');
+    }
+  });
+
   await check('the folder API reports honestly on this browser', async () => {
     const s = await Backend.folderStatus();
     eq(typeof s.supported, 'boolean', 'supported is a boolean');
