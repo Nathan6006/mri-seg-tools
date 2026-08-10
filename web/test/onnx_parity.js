@@ -66,7 +66,23 @@ async function main() {
 
   const tInit = performance.now();
   // ?backend=wasm / ?backend=webgpu pins one, so the two can be compared.
-  const model = await onnx.openModel(bundle, params.get('backend'));
+  // A pinned backend that cannot run this model is a fact worth reporting, not
+  // a failure: onnxruntime-web's WebGPU provider does not implement every op,
+  // and refusing to fall back is the whole point of pinning.
+  const force = params.get('backend');
+  let model;
+  try {
+    // ?warmup=0 isolates the warm-up pass, to tell a runtime defect apart
+    // from one this test introduced.
+    model = await onnx.openModel(bundle, force, params.get('warmup') !== '0');
+  } catch (e) {
+    if (force) {
+      say(`\n${force} cannot run this model: ${e.message}`, 'bad');
+      await report({ skipped: true, backend: force, modelId: entry.id, reason: e.message });
+      return;
+    }
+    throw e;
+  }
   say(`session started on "${model.backend}" in ${((performance.now() - tInit) / 1000).toFixed(1)}s`);
   say(`${model.dim}D model, patch ${model.patch.join('x')}, ` +
       `mirror axes [${(model.meta.mirror_axes || []).join(',')}]`);

@@ -1899,6 +1899,7 @@ function renderNetPick(){
   }
 }
 
+
 $('#netPick').onchange = async e => {
   const id = e.target.value;
   const label = (STATE.model_choices || []).find(c => c.id === id);
