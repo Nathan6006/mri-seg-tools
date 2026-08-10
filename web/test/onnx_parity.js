@@ -72,9 +72,7 @@ async function main() {
   const force = params.get('backend');
   let model;
   try {
-    // ?warmup=0 isolates the warm-up pass, to tell a runtime defect apart
-    // from one this test introduced.
-    model = await onnx.openModel(bundle, force, params.get('warmup') !== '0');
+    model = await onnx.openModel(bundle, force);
   } catch (e) {
     if (force) {
       say(`\n${force} cannot run this model: ${e.message}`, 'bad');
@@ -96,7 +94,21 @@ async function main() {
     const ref = await readNifti(new Uint8Array(
       await (await fetch(`/fixture/${c.mask}`)).arrayBuffer()));
 
-    const { mask } = await model.segment(img, { tta: c.tta !== false });
+    let mask;
+    try {
+      ({ mask } = await model.segment(img, { tta: c.tta !== false }));
+    } catch (e) {
+      // A backend that cannot run this model now says so on the first RUN
+      // rather than at load: the session builds, and the missing kernel only
+      // surfaces once something goes through it. Nothing probes for that any
+      // more, because the probe was corrupting the very backend it tested.
+      if (force && !results.length) {
+        say(`\n${force} cannot run this model: ${e.message}`, 'bad');
+        await report({ skipped: true, backend: force, modelId: entry.id, reason: e.message });
+        return;
+      }
+      throw e;
+    }
 
     let diff = 0, ours = 0, theirs = 0;
     for (let i = 0; i < mask.length; i++) {

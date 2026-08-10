@@ -1835,12 +1835,25 @@ function renderModelCard(){
     : STATE.model_error ? 'error' : 'none';
 
   if(STATE.model_loading && !info){
-    el.innerHTML = 'Starting the model…';
+    // Tens of megabytes over a home connection is a minute or more, and a card
+    // that just says "Starting…" for that long reads as broken. Show the bytes.
+    const p = STATE.model_progress;
+    const which = (STATE.model_choices || []).find(c => c.id === STATE.model_id);
+    const name = which ? which.label : 'the model';
+    el.innerHTML = p && p.total
+      ? `Downloading ${name} — ${(p.done/1e6).toFixed(0)} of ${(p.total/1e6).toFixed(0)} MB…`
+        + ` <span class="meta">Once it is here it is cached, so this happens once.</span>`
+      : `Starting the model…`;
   } else if(info){
     const mb = (info.bytes/1e6).toFixed(0);
+    // A 3D model does not use the GPU and never will — the runtime's 3-D
+    // convolutions are about ten times slower there than on the CPU — so
+    // telling its user that another browser would be faster is just wrong.
     const backend = info.backend === 'webgpu'
       ? 'running on the GPU (WebGPU)'
-      : 'running on the CPU (WebAssembly) — slower; Chrome or Edge will use the GPU';
+      : info.dim === 3
+        ? 'running on the CPU (WebAssembly), which is the fast path for a 3D model'
+        : 'running on the CPU (WebAssembly) — slower; Chrome or Edge will use the GPU';
     const which = info.config ? ` <code>${info.config}</code>` : '';
     el.innerHTML = `<strong style="color:var(--ok)">Trained model loaded.</strong>`
       + `${which} ${info.precision}, ${mb} MB, ${backend}.`
@@ -2187,9 +2200,11 @@ function unsupported(){
     await Backend.init();
     await refreshFolder();
     await refresh();
-    // The model finishes starting a second or two later. Re-render then, so
-    // the card stops saying "Starting…" without the user having to click.
-    Backend.modelReady().then(s => { STATE = s; renderModelCard(); });
+    // The model finishes starting later — seconds on a cached copy, minutes on
+    // a first visit over a slow connection. Re-render while it downloads so the
+    // card shows progress, and once more when it settles.
+    const beat = setInterval(() => { STATE = Backend.state(); renderModelCard(); }, 400);
+    Backend.modelReady().then(s => { clearInterval(beat); STATE = s; renderModelCard(); });
   }catch(e){
     console.error(e);
     toast(e.message, true);

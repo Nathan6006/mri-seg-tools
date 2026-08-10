@@ -341,7 +341,11 @@ export class OnnxPredictor extends Predictor {
     // months later to work out what produced a mask — so it names the
     // configuration, not just a digest.
     const cfg = model.meta?.config || `${model.dim}d`;
-    this.name = `onnx:${cfg}:${model.manifest.version} (${model.backend})`;
+    // Mirroring is part of what produced the mask, not a preference — two runs
+    // of the same weights with and without it give different volumes. Since it
+    // is now off by default, a results file that does not say so is ambiguous.
+    const how = this.tta ? '' : ', no mirroring';
+    this.name = `onnx:${cfg}:${model.manifest.version} (${model.backend}${how})`;
     const { prob, mask } = await model.segment(vol, {
       tta: this.tta, onProgress: opts.onProgress,
     });

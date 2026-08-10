@@ -684,6 +684,29 @@ export async function run() {
    * The mask itself is meaningless here: the fixture is a synthetic gradient,
    * not anatomy. Shapes, grid and value range are the point.
    */
+  /**
+   * `modelReady()` must cover the WHOLE load, index fetch included.
+   *
+   * It did not. `STATE.modelReady` was assigned part-way through
+   * `autoloadModel`, after the index had been fetched, so a caller that asked
+   * before that assignment got nothing to wait on and carried on as if there
+   * were no model. The app renders its model card on exactly that promise, so
+   * losing the race meant a permanent "no trained model is loaded" on a page
+   * that was in fact about to load one. Whether it lost depended on how quickly
+   * IndexedDB opened, which is why it looked intermittent.
+   */
+  await check('modelReady() covers the whole load, index fetch included', async () => {
+    const onnx = await import('../lib/onnx.js');
+    if (!await onnx.servedModelIndex('../model/')) return;   // no weights published
+    const p = Backend.autoloadModel();
+    truthy(Backend.STATE.modelReady,
+           'STATE.modelReady must be set synchronously, before the first await');
+    await p;
+    await Backend.modelReady();
+    truthy(Backend.state().model_info,
+           'once modelReady() resolves, a served model must actually be loaded');
+  });
+
   await check('the trained model returns mask and probability on the scan grid',
     async () => {
       const onnx = await import('../lib/onnx.js');
