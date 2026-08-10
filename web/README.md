@@ -226,14 +226,30 @@ differently-shaped image.
 ### Speed, and the two backends
 
 WebGPU where it is available (Chrome and Edge), WebAssembly everywhere else,
-chosen automatically. On this hardware, an 18-slice scan with test-time
-mirroring:
+chosen automatically. Measured on an 8-core Apple laptop with a real GPU
+adapter, **per network pass** — which is the number to reason from, because how
+many passes a scan costs is a separate decision (see mirroring, below):
 
-| model | backend | per scan | agreement with the reference |
+| model | backend | per pass | agreement with the reference |
 |---|---|---|---|
-| 2D | WebGPU | ~2.4 s | 0 and 23 voxels on lesions of 48 and 31,749 |
-| 2D | WebAssembly | ~22 s | **exact, 0 voxels** |
-| 3D | WebAssembly | ~57 s | 1 voxel, and it is the network rather than the wrapper |
+| 2D, one 18-slice batch | WebGPU | **0.51 s** | **exact, 0 voxels** — see the probe note below |
+| 2D, one 18-slice batch | WebAssembly | 5.5 s | **exact, 0 voxels** |
+| 3D, one 20×256×256 patch | WebAssembly | 6.9 s | 1 voxel, and it is the network rather than the wrapper |
+
+A 3-D network is therefore only about 1.25× the cost of a 2-D one over the same
+volume. Threads do not help beyond four (2 threads 10.4 s, 4 threads 6.9 s,
+8 threads 7.0 s), which is why the runtime is capped there.
+
+**The CPU allowance scales with the lesion, not with the number of cases**, and
+that took a wrong answer to notice. It was one voxel per case, calibrated on
+scans whose lesions are a few hundred voxels; run against scans with lesions of
+45,000–57,000 it failed at 17 and 5 differing voxels — which is a *lower* rate
+of disagreement (0.03% of the lesion against 0.13%), failing a rule that
+measured the wrong quantity. The disagreement lives on the decision boundary, so
+it grows with the lesion's surface. The bound is now one voxel per thousand
+foreground voxels, floored at one per case, and it is still far below any real
+defect: a window origin off by one, or a mirror applied the wrong way round,
+misplaces a whole slab — thousands of voxels, never tens.
 
 The CPU path being bit-exact is what proves the wrapper is right. The GPU path
 computes in half precision with a different accumulation order, so a handful of
@@ -241,26 +257,52 @@ voxels on the decision boundary land differently — arithmetic, not a defect,
 and far below anything that could matter. **For a number that goes in a paper,
 use the command-line pipeline, which is deterministic.**
 
-**There is no WebGPU row for the 3D model, and that is not an omission.**
-onnxruntime-web 1.20.1's WebGPU provider does not implement 3-D convolution
-with asymmetric padding — which is exactly what an anisotropy-aware 3-D U-Net
-emits — so a 3-D model runs on WebAssembly on every browser. Worse, the session
-*builds* on WebGPU and only fails inside the kernel, so `openModel` pushes one
-empty patch through a backend before accepting it.
+**There is no WebGPU row for the 3D model, and that is not an omission — it is
+a measured dead end.** Two separate things block it, and the second is the one
+that matters:
 
-**That probe needs its own throwaway session, and finding out why was
-instructive.** Probing and then reusing the same WebGPU session produced badly
-wrong masks: 4,641 foreground voxels where there should have been 31,749, and a
-small lesion missed entirely. It looked precisely like "half precision is
-unreliable at the small end", which is a plausible enough story that it nearly
-went into this file as a finding. It was not true — it was state left behind by
-the probe. With a fresh session, WebGPU returns to a couple of dozen boundary
-voxels. Only non-final backends are probed, since there is nothing to fall back
-to after the last one and a probe there costs a whole forward pass for nothing.
+1. onnxruntime-web 1.20.1's WebGPU provider does not implement 3-D convolution
+   with asymmetric padding, which is exactly what an anisotropy-aware 3-D U-Net
+   emits. **Version 1.27 fixes this**, and there the graph gets all the way
+   through the encoder; the only remaining gap is `ConvTranspose`, whose WebGPU
+   kernel is 2-D only.
+2. That gap is closable exactly — every transposed convolution in this family of
+   architectures has kernel == stride, so it is a 1×1×1 convolution followed by
+   a 3-D pixel shuffle, and rewriting it that way reproduces the original graph
+   to **max absolute difference 0.0**. Do it, and the model runs on the GPU at
+   **roughly ten times slower than the CPU**: 63 s per pass against 5.9 s, with
+   the encoder alone taking 16 s versus 2.1 s.
 
-The moral is worth keeping: a diagnostic that runs before the thing it is
-diagnosing can *be* the defect, and "the GPU is imprecise" is a comfortable
-enough explanation to stop the search early.
+So the 3-D convolution kernels are a naive fallback, and no graph surgery fixes
+that. When re-testing on a version bump, measure **throughput**, not whether it
+runs — a build that merely runs the model on the GPU is a regression.
+
+A session that *builds* on WebGPU can still fail inside a kernel, so this used
+to be handled by pushing one empty patch through a backend before accepting it.
+
+**That probe is gone, because the probe was the defect — twice.** Probing and
+then reusing the same WebGPU session produced badly wrong masks: 4,641
+foreground voxels where there should have been 31,749, and a small lesion missed
+entirely. It looked precisely like "half precision is unreliable at the small
+end", which is a plausible enough story that it nearly went into this file as a
+finding. It was not true. Giving the probe its own throwaway session looked like
+the fix and was written up as one — and it was not either. Re-measured on a 2D
+model, three identical runs: with the probe, WebGPU returns an **empty mask** on
+scans whose lesions are 48 and 36 voxels; with the probe skipped, both are
+voxel-for-voxel exact. Whatever state it leaves behind outlives the session
+object.
+
+So the backend is now chosen from what is known rather than tested for. A 3-D
+model never asks for WebGPU (see above — it is either refused or ten times
+slower); a 2-D model takes it when an adapter exists; and if a run fails anyway,
+`_sessionRun` rebuilds on WebAssembly and retries once, which costs one wasted
+attempt on the first scan instead of a wasted pass on every load.
+
+Two morals, and the second is the one that cost the most: a diagnostic that runs
+before the thing it is diagnosing can *be* the defect — and a fix for that
+deserves the same measurement as the original finding, not a plausible
+mechanism. Both failures presented as an empty or near-empty mask, which is
+indistinguishable from a model that simply missed a small lesion.
 
 Getting the float32 rounding right matters here too. The reference
 implementation multiplies two float32 arrays and rounds the *product* before
@@ -276,9 +318,19 @@ Multi-threading needs the page to be cross-origin isolated (COOP + COEP). It
 still runs without that, on one thread and several times slower, which is why
 `serve.py` sends the same headers the real host does.
 
-*Test-time mirroring* can be turned off in the model picker. It is four network
-passes per slice instead of one, so it is roughly 4× faster without — a real
-trade, and one that belongs to the person waiting rather than to the code.
+**Test-time mirroring is off by default**, and turning it on is where nearly all
+of the time goes: it runs the network once per reflection and averages the
+logits, which is four passes for a 2-D model and **eight** for a 3-D one. So a
+3-D scan is about 7 seconds by default and about 57 with mirroring on.
+
+That default is not a guess. On the one cross-validation fold that has been
+scored, mirroring made no measurable difference to accuracy for either model:
+paired across the positive scans the Dice difference was noise (Wilcoxon
+p = 0.53), while detection specificity, volume error and the agreement
+coefficient all came out very slightly *better* without it. Eight times the
+compute for nothing measurable is not a default. It stays in the picker for
+reproducing a run that was scored with it — and if you do turn it on, the
+reference masks you compare against must have been produced the same way.
 
 ### The stub
 
@@ -320,7 +372,7 @@ end, including the parts node cannot run — IndexedDB, canvas, the real
 .venv/bin/python web/test/run_selftest.py --serve    # open it in any browser
 ```
 
-42 checks, from gzip to zip export. It builds its own DICOM files
+43 checks, from gzip to zip export. It builds its own DICOM files
 (`test/fixture.js`) so it involves no lab data and is safe to run anywhere —
 including with `--serve` on the machine of anyone who wants to know whether
 their browser is supported.

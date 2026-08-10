@@ -43,6 +43,7 @@ export const STATE = {
   model: null,
   modelAvailable: false,
   modelLoading: false,
+  modelProgress: null,       // { done, total } bytes while the weights download
   modelReady: null,
   modelError: null,
   modelIndex: null,          // which networks the site serves, if any
@@ -109,6 +110,7 @@ export function state() {
     model_info: onnx.activeModelInfo(),
     model_available: STATE.modelAvailable,
     model_loading: STATE.modelLoading,
+    model_progress: STATE.modelProgress,
     model_error: STATE.modelError || null,
     model_choices: STATE.modelIndex ? STATE.modelIndex.models : null,
     model_id: STATE.modelId,
@@ -130,7 +132,21 @@ export function state() {
  * weights is a supported configuration, not an error. The tool falls back to
  * the stub and the banner says so.
  */
-export async function autoloadModel() {
+export function autoloadModel() {
+  // STATE.modelReady is assigned SYNCHRONOUSLY, before any await runs. It used
+  // to be set part-way through, after the index had been fetched, which left a
+  // window where `modelReady()` had nothing to wait on and returned at once --
+  // and a caller that re-rendered on that promise would paint "no model" and
+  // never look again. The whole load, index included, is one promise.
+  STATE.modelLoading = true;
+  STATE.modelProgress = null;
+  STATE.modelReady = _autoloadModel()
+    .then((id) => { STATE.modelLoading = false; STATE.modelError = id ? null : STATE.modelError; })
+    .catch((e) => { STATE.modelLoading = false; STATE.modelError = e.message; });
+  return STATE.modelReady;
+}
+
+async function _autoloadModel() {
   const chosen = STATE.model;                 // what the user last picked, if anything
   // Which *network*, as opposed to which predictor. Remembered separately: a
   // reviewer who deliberately switched to the 2D model should not be moved back
@@ -148,28 +164,52 @@ export async function autoloadModel() {
   const index = await onnx.servedModelIndex('./model/');
   STATE.modelIndex = index;
   STATE.modelAvailable = !!index;
+  // Which one is about to load, named before the download starts rather than
+  // after it finishes, so the progress line can say what it is fetching.
+  if (index) {
+    const wanted = index.models.find((m) => m.id === preferId)
+      || index.models.find((m) => m.id === index.default) || index.models[0];
+    STATE.modelId = wanted.id;
+  }
 
   // Default to the trained model, but never override a deliberate choice. The
   // first version of this reset the setting on every reload, which quietly
   // undid "use the stub" and "no mirroring" every time the page was opened.
+  //
+  // WITHOUT test-time mirroring, deliberately. Mirroring runs the network once
+  // per reflection -- four passes for a 2D model, eight for a 3D one -- and on
+  // the one fold that has been scored it bought nothing: paired across the
+  // positive scans the Dice difference was noise, while detection specificity,
+  // volume error and the agreement coefficient all came out very slightly
+  // better without it. Eight times the compute for no measurable accuracy is
+  // not a default; it is an option, and it is still in the picker.
   if (!chosen && index) {
-    STATE.model = 'onnx';
-    await store.setKV('model', 'onnx');
+    STATE.model = 'onnx:no-tta';
+    await store.setKV('model', 'onnx:no-tta');
   }
 
-  STATE.modelLoading = true;
-  STATE.modelReady = (async () => {
-    const { bundle, id } = await onnx.autoloadBundle('./model/', preferId);
-    STATE.modelId = id;
-    STATE.modelAvailable = !!bundle;
-    if (!bundle) return null;
-    if (id && id !== preferId) await store.setKV('model_id', id);
-    await onnx.setActiveBundle(bundle, id);
-    return id;
-  })()
-    .then((id) => { STATE.modelLoading = false; STATE.modelError = id ? null : STATE.modelError; })
-    .catch((e) => { STATE.modelLoading = false; STATE.modelError = e.message; });
-  return STATE.modelReady;
+  // ONE-TIME MIGRATION, and it is needed precisely because the old default was
+  // written to storage rather than left unset. Everyone who has opened the tool
+  // before has `model = "onnx"` stored, so "never override a deliberate choice"
+  // would keep every existing reviewer on the slow path forever, for a choice
+  // they never actually made. The marker means a deliberate switch back to
+  // mirroring after this point survives reloads.
+  if (index && !await store.getKV('mirroring_default_changed', false)) {
+    if (STATE.model === 'onnx') {
+      STATE.model = 'onnx:no-tta';
+      await store.setKV('model', 'onnx:no-tta');
+    }
+    await store.setKV('mirroring_default_changed', true);
+  }
+
+  const { bundle, id } = await onnx.autoloadBundle('./model/', preferId,
+    (done, total) => { STATE.modelProgress = { done, total }; });
+  STATE.modelId = id;
+  STATE.modelAvailable = !!bundle;
+  if (!bundle) return null;
+  if (id && id !== preferId) await store.setKV('model_id', id);
+  await onnx.setActiveBundle(bundle, id);
+  return id;
 }
 
 /**

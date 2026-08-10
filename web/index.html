@@ -375,8 +375,8 @@
     <p class="hint" id="netNote" style="margin-top:6px;display:none"></p>
     <div class="row" style="margin-top:10px">
       <select id="modelPick" class="grow" style="font-size:12px;padding:4px 8px">
-        <option value="onnx">Trained model (with test-time mirroring)</option>
-        <option value="onnx:no-tta">Trained model — no mirroring (faster)</option>
+        <option value="onnx:no-tta">Trained model (default)</option>
+        <option value="onnx">Trained model with test-time mirroring — 4–8× slower</option>
         <option value="stub">Stub (synthetic masks, for testing the tool)</option>
       </select>
     </div>
@@ -391,6 +391,11 @@
     <p class="hint" style="margin-top:10px">The model is downloaded once and
       kept in this browser. It never leaves your machine, and neither do the
       scans it runs on.</p>
+    <p class="hint" style="margin-top:6px"><strong>Test-time mirroring</strong>
+      runs the network once per reflection — four passes for a 2D model, eight
+      for a 3D one — and averages them. On the fold that has been scored it made
+      no measurable difference to accuracy, so it is off by default. Turn it on
+      to reproduce a run that was scored with it.</p>
   </div>
 
   <div class="card">

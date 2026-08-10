@@ -184,15 +184,48 @@ function joinShards(parts, total) {
  */
 export async function fetchBundle(manifest, base = './model/', onProgress = null) {
   const graph = new Uint8Array(await (await fetch(`${base}${manifest.graph}`)).arrayBuffer());
-  const parts = [];
+
+  // The shards are fetched CONCURRENTLY and read as streams. Both matter, for
+  // different reasons. One-at-a-time left the connection idle for a round trip
+  // between every 20 MB piece, which on a home connection is most of a minute
+  // of not downloading; a browser will happily run six requests at once and
+  // HTTP/2 multiplexes them over the one connection anyway. Streaming is what
+  // makes the progress readout move continuously rather than jumping in five
+  // steps -- and a progress bar that sits still for twenty seconds is
+  // indistinguishable, to the person waiting, from one that has hung.
   let done = 0;
-  for (const s of manifest.shards) {
+  const tick = () => { if (onProgress) onProgress(done, manifest.weights_bytes); };
+  tick();
+
+  const parts = await Promise.all(manifest.shards.map(async (s) => {
     const res = await fetch(`${base}${s.name}`);
     if (!res.ok) throw new Error(`cannot fetch ${s.name}: HTTP ${res.status}`);
-    parts.push(new Uint8Array(await res.arrayBuffer()));
-    done += s.bytes;
-    if (onProgress) onProgress(done, manifest.weights_bytes);
-  }
+    if (!res.body) {                       // no streams: fall back to the whole body
+      const buf = new Uint8Array(await res.arrayBuffer());
+      done += buf.length;
+      tick();
+      return buf;
+    }
+    const out = new Uint8Array(s.bytes);
+    const reader = res.body.getReader();
+    let at = 0;
+    for (;;) {
+      const { value, done: end } = await reader.read();
+      if (end) break;
+      // A shard longer than the manifest says means the files and the manifest
+      // disagree; joinShards would catch it later, but not before writing past
+      // the end of this buffer.
+      if (at + value.length > out.length) {
+        throw new Error(`${s.name} is longer than the manifest says (${s.bytes} bytes)`);
+      }
+      out.set(value, at);
+      at += value.length;
+      done += value.length;
+      tick();
+    }
+    return out.subarray(0, at);
+  }));
+
   const weights = joinShards(parts, manifest.weights_bytes);
   const digest = await sha256Hex(weights);
   if (digest !== manifest.weights_sha256) {
@@ -356,7 +389,37 @@ export class OnnxModel {
     this.backend = null;
   }
 
-  async init(force = null, warmup = true) {
+  /**
+   * Build the inference session, choosing a backend.
+   *
+   * NOTHING IS PUSHED THROUGH THE SESSION HERE, and that is a correction of an
+   * earlier design. There used to be a probe -- one empty patch through a
+   * throwaway session -- because a WebGPU session builds happily and then fails
+   * inside a kernel it does not implement, so without it the model appeared to
+   * load and the first real scan threw.
+   *
+   * The probe itself corrupts the backend. Measured, repeatably: with the probe
+   * enabled, a 2D model on WebGPU returned an EMPTY MASK on two scans whose
+   * lesions are 48 and 36 voxels; with the probe skipped the same scans came back
+   * voxel-for-voxel exact. Giving the probe its own throwaway session was
+   * supposed to have fixed that and does not -- whatever state it leaves behind
+   * outlives the session object. A diagnostic that silently blanks the output it
+   * is diagnosing is worse than the failure it was added to catch, because an
+   * empty mask on a small lesion looks exactly like a model that missed one.
+   *
+   * So the backend is chosen from what is known rather than tested for:
+   *
+   *   - A 3D model never asks for WebGPU. The runtime either refuses its
+   *     convolutions outright or, in versions that accept them, runs them about
+   *     ten times slower than the CPU. There is no version in which this is the
+   *     wrong call.
+   *   - A 2D model takes WebGPU when the adapter is there, which is where the
+   *     ~10x speed-up lives.
+   *   - If a run fails anyway, `_sessionRun` rebuilds on WebAssembly and retries
+   *     once. Discovering an unsupported operator costs one wasted attempt on
+   *     the first scan instead of a wasted pass on every load.
+   */
+  async init(force = null) {
     assertCompatible(this.meta);
     const o = await ort();
 
@@ -367,55 +430,22 @@ export class OnnxModel {
 
     // `force` exists for the parity test, which needs to compare the backends
     // against each other rather than take whichever one the machine offers.
-    //
     const attempts = force ? [force] : [];
     if (!force) {
-      if (await webgpuUsable()) attempts.push('webgpu');
+      if (this.dim === 2 && await webgpuUsable()) attempts.push('webgpu');
       attempts.push('wasm');
     }
 
-    const build = (ep) => o.InferenceSession.create(this.bundle.graph, {
+    this._build = (ep) => o.InferenceSession.create(this.bundle.graph, {
       executionProviders: [ep],
       graphOptimizationLevel: 'all',
       externalData: external,
     });
 
     let lastErr = null;
-    for (let i = 0; i < attempts.length; i++) {
-      const ep = attempts[i];
-      const isLast = i === attempts.length - 1;
+    for (const ep of attempts) {
       try {
-        // A SESSION THAT BUILDS IS NOT A SESSION THAT RUNS. WebGPU accepts this
-        // 3D model's graph and then fails inside a kernel it does not
-        // implement -- "Unsupported padding parameter" -- but only once
-        // something is pushed through. Without a probe the model appears to
-        // load, the card says "loaded", and the first scan a reviewer runs
-        // throws.
-        //
-        // THE PROBE GETS ITS OWN SESSION, WHICH IS THEN THROWN AWAY. Reusing
-        // the probed session is not safe: running a dummy input through a
-        // WebGPU session and then a real one produced badly wrong masks --
-        // 4,641 foreground voxels where there should have been 31,749, and a
-        // small lesion lost entirely. That looked exactly like "half precision
-        // is unreliable" and was nothing of the kind; it was state left behind
-        // by the probe. A fresh session gives WebGPU's normal behaviour, which
-        // is a couple of dozen boundary voxels.
-        //
-        // Only non-final backends are probed automatically: there is nothing
-        // to fall back to after the last one, so a probe there would buy
-        // nothing and cost a whole forward pass -- seconds, for a 3D model.
-        // A PINNED backend is always probed, because the caller asked
-        // specifically whether that one works and deserves the answer at load
-        // rather than halfway through a scan.
-        if (warmup && (force || !isLast)) {
-          const probe = await build(ep);
-          try {
-            await this._probe(o, probe);
-          } finally {
-            await probe.release?.();
-          }
-        }
-        this.session = await build(ep);
+        this.session = await this._build(ep);
         this.backend = ep;
         return this;
       } catch (err) {
@@ -430,16 +460,30 @@ export class OnnxModel {
     throw new Error(`could not run the model on any backend. Last error: ${lastErr?.message}`);
   }
 
-  /** Push one empty patch through a throwaway session, to see if this backend works. */
-  async _probe(o, session) {
-    const patch = this.patch;
-    const t = new o.Tensor('float32',
-                           new Float32Array(patch.reduce((a, b) => a * b, 1)),
-                           [1, 1, ...patch]);
-    const res = await session.run({ [session.inputNames[0]]: t });
-    const out = res[session.outputNames[0]];
-    if (!out || !out.data || !out.data.length) {
-      throw new Error('the model produced no output on a probe pass');
+  /**
+   * Run the session, falling back to WebAssembly once if the backend cannot.
+   *
+   * The failure this catches is a kernel the execution provider does not
+   * implement, which surfaces on the first run rather than at build time. It is
+   * deliberately not silent: the backend is renamed so `results.json` records
+   * what actually ran.
+   *
+   * In principle a scan could straddle the switch -- some passes on one backend,
+   * the rest on the other -- if the unsupported kernel only appeared part way
+   * through. In practice an unimplemented operator fails on the very first pass,
+   * and the two backends agree to a handful of boundary voxels anyway, so this
+   * is not worth restarting the scan for.
+   */
+  async _sessionRun(feeds) {
+    try {
+      return await this.session.run(feeds);
+    } catch (err) {
+      if (this.backend === 'wasm' || this._pinned) throw err;
+      console.warn(`onnxruntime: ${this.backend} failed mid-run (${err.message}); ` +
+                   `rebuilding on wasm`);
+      this.session = await this._build('wasm');
+      this.backend = 'wasm';
+      return this.session.run(feeds);
     }
   }
 
@@ -591,7 +635,7 @@ export class OnnxModel {
         }
       }
       const t = new o.Tensor('float32', fed, [count, 1, ph, pw]);
-      const res = await this.session.run({ [inName]: t });
+      const res = await this._sessionRun({ [inName]: t });
       const logits = res[this.session.outputNames[0]].data;
 
       // Unflip on the way back, so every mirroring is accumulated in the
@@ -646,7 +690,7 @@ export class OnnxModel {
         fed = buf;
       }
       const t = new o.Tensor('float32', fed, [1, 1, pz, py, px]);
-      const res = await this.session.run({ [inName]: t });
+      const res = await this._sessionRun({ [inName]: t });
       const logits = res[this.session.outputNames[0]].data;
 
       // Unflip on the way back, so every mirroring is accumulated in the
@@ -811,9 +855,12 @@ export class OnnxModel {
 }
 
 /** Build and start a model from whatever source is available. */
-export async function openModel(bundle, force = null, warmup = true) {
+export async function openModel(bundle, force = null) {
   const m = new OnnxModel(bundle);
-  await m.init(force, warmup);
+  // A pinned backend is answering the question "what does THIS one do", so it
+  // must not quietly become another one mid-run.
+  m._pinned = !!force;
+  await m.init(force);
   return m;
 }
 
@@ -883,7 +930,8 @@ export async function loadServedBundle(entry, base = './model/', onProgress = nu
  * beside the page. Returns `{ bundle, index, id }`, with a null bundle if
  * nothing is available and the user has to supply a folder.
  */
-export async function autoloadBundle(base = './model/', preferId = null) {
+export async function autoloadBundle(base = './model/', preferId = null,
+                                     onProgress = null) {
   const index = await servedModelIndex(base);
   if (!index) {
     // Nothing served. A previous session may still have cached one, either
@@ -897,5 +945,5 @@ export async function autoloadBundle(base = './model/', preferId = null) {
   const wanted = index.models.find((m) => m.id === preferId)
     || index.models.find((m) => m.id === index.default)
     || index.models[0];
-  return { bundle: await loadServedBundle(wanted, base), index, id: wanted.id };
+  return { bundle: await loadServedBundle(wanted, base, onProgress), index, id: wanted.id };
 }
