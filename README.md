@@ -108,21 +108,30 @@ zip. And results live in **IndexedDB**, so they are per-browser and per-machine
 until you export them.
 
 A trained network runs **in the tab**, as ONNX under onnxruntime-web — WebGPU
-where it is available, WebAssembly everywhere else. Weights are not in this
-repo: they are a derivative of whatever imaging they were trained on, so
-publishing them is the data owner's call, not a build step's. The tool loads
-them from `web/model/` if a deployment serves it, or from a folder the user
-picks; with neither it falls back to a deterministic stub and shows a permanent
-banner saying the masks are synthetic.
+where it is available, WebAssembly everywhere else. Both 2D and 3D
+configurations are supported, and a deployment can serve several and let the
+user switch; only the one in use is downloaded. Weights are not in this repo:
+they are a derivative of whatever imaging they were trained on, so publishing
+them is the data owner's call, not a build step's. The tool loads them from
+`web/model/` if a deployment serves it, or from a folder the user picks; with
+neither it falls back to a deterministic stub and shows a permanent banner
+saying the masks are synthetic.
 
-The preprocessing around the network — normalise, pad, mirror, argmax — is the
-part that can be silently wrong, so it is written twice and cross-checked.
-`web/test/run_onnx_parity.py` drives real scans through the browser and
-compares them voxel by voxel against masks produced outside it. **On the CPU
-backend the browser is exact.** The GPU backend differs by a handful of
-boundary voxels, which is half-precision arithmetic rather than a defect — so
-for numbers that go in a paper, use the command-line pipeline, which is
-deterministic.
+The preprocessing around the network — normalise, pad, slide the window, mirror,
+argmax — is the part that can be silently wrong, so it is written twice and
+cross-checked. `web/test/run_onnx_parity.py` drives real scans through the
+browser and compares them voxel by voxel against masks produced outside it.
+**On the CPU backend the browser is exact.** The GPU backend differs by a
+handful of boundary voxels, which is half-precision arithmetic rather than a
+defect — so for numbers that go in a paper, use the command-line pipeline,
+which is deterministic.
+
+Two details in the 3D path are worth knowing if you port this. Window origins
+are computed with round-half-to-even, which `Math.round` is not, and the
+one-voxel shift that follows from getting it wrong is invisible. And the
+Gaussian importance map that weights overlapping windows is exactly separable,
+so the exporter ships three 1-D vectors rather than asking JavaScript to
+reproduce `scipy.ndimage.gaussian_filter`.
 
 ## Three opinions baked in
 

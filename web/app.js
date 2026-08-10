@@ -1841,8 +1841,9 @@ function renderModelCard(){
     const backend = info.backend === 'webgpu'
       ? 'running on the GPU (WebGPU)'
       : 'running on the CPU (WebAssembly) — slower; Chrome or Edge will use the GPU';
-    el.innerHTML = `<strong style="color:var(--ok)">Trained model loaded.</strong> `
-      + `${info.precision}, ${mb} MB, ${backend}.`
+    const which = info.config ? ` <code>${info.config}</code>` : '';
+    el.innerHTML = `<strong style="color:var(--ok)">Trained model loaded.</strong>`
+      + `${which} ${info.precision}, ${mb} MB, ${backend}.`
       + (info.trainer ? ` <span class="meta">${info.trainer}, fold ${info.fold},`
                       + ` epoch ${info.epoch}.</span>` : '');
   } else if(STATE.model_error){
@@ -1861,9 +1862,58 @@ function renderModelCard(){
     // next run. Disable rather than let it be picked.
     for(const o of pick.options) if(o.value.startsWith('onnx')) o.disabled = !info;
   }
+  renderNetPick();
   const forget = $('#btnForgetModel');
   if(forget) forget.style.display = info ? '' : 'none';
 }
+
+// Which network, as opposed to which predictor. A site can serve more than one
+// -- a 2D and a 3D model usually differ more in how they fail than in how well
+// they score -- so this is a real choice and the note under it says what the
+// trade is. With one model served, or none, the whole row stays hidden.
+function renderNetPick(){
+  const row = $('#netPickRow'), sel = $('#netPick'), note = $('#netNote');
+  if(!row || !sel) return;
+  const choices = STATE.model_choices || [];
+  if(choices.length < 2){ row.style.display = 'none'; if(note) note.style.display='none'; return; }
+
+  const want = choices.map(c => c.id).join('|');
+  if(sel.dataset.built !== want){
+    sel.innerHTML = '';
+    for(const c of choices){
+      const o = document.createElement('option');
+      o.value = c.id;
+      o.textContent = `${c.label || c.id}  (${(c.bytes/1e6).toFixed(0)} MB)`;
+      sel.appendChild(o);
+    }
+    sel.dataset.built = want;
+  }
+  row.style.display = '';
+  if(STATE.model_id) sel.value = STATE.model_id;
+  sel.disabled = !!STATE.model_loading;
+
+  const cur = choices.find(c => c.id === (STATE.model_id || sel.value));
+  if(note){
+    note.textContent = cur && cur.note ? cur.note : '';
+    note.style.display = cur && cur.note ? '' : 'none';
+  }
+}
+
+$('#netPick').onchange = async e => {
+  const id = e.target.value;
+  const label = (STATE.model_choices || []).find(c => c.id === id);
+  // The first switch downloads tens of megabytes. Say so, because otherwise the
+  // card just sits on "Starting the model…" for a while and looks stuck.
+  toast(`Loading ${label ? label.label : id}…`);
+  try{
+    STATE = await Backend.setModelId(id, (done, total) => {
+      const el = $('#modelState');
+      if(el) el.innerHTML = `Downloading ${(done/1e6).toFixed(0)} of ${(total/1e6).toFixed(0)} MB…`;
+    });
+    refresh(); renderModelCard();
+    toast(`${label ? label.label : id} ready.`);
+  }catch(err){ toast(err.message, true); renderModelCard(); }
+};
 
 $('#modelPick').onchange = async e => {
   try{ STATE = await Backend.setModel(e.target.value); refresh(); }

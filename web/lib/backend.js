@@ -45,6 +45,8 @@ export const STATE = {
   modelLoading: false,
   modelReady: null,
   modelError: null,
+  modelIndex: null,          // which networks the site serves, if any
+  modelId: null,             // which of them is loaded
   minVoxels: 0,
   cases: [],
   storage: { supported: false, persisted: false, used: 0, quota: 0 },
@@ -104,6 +106,8 @@ export function state() {
     model_available: STATE.modelAvailable,
     model_loading: STATE.modelLoading,
     model_error: STATE.modelError || null,
+    model_choices: STATE.modelIndex ? STATE.modelIndex.models : null,
+    model_id: STATE.modelId,
     min_voxels: STATE.minVoxels,
     storage: STATE.storage,
     cases: STATE.cases,
@@ -124,9 +128,16 @@ export function state() {
  */
 export async function autoloadModel() {
   const chosen = STATE.model;                 // what the user last picked, if anything
-  const bundle = await onnx.autoloadBundle();
+  // Which *network*, as opposed to which predictor. Remembered separately: a
+  // reviewer who deliberately switched to the 2D model should not be moved back
+  // to the served default on every reload.
+  const preferId = await store.getKV('model_id', null);
+  const { bundle, index, id } = await onnx.autoloadBundle('./model/', preferId);
+  STATE.modelIndex = index;
+  STATE.modelId = id;
   STATE.modelAvailable = !!bundle;
   if (!bundle) return null;
+  if (id && id !== preferId) await store.setKV('model_id', id);
 
   // Default to the trained model, but never override a deliberate choice. The
   // first version of this reset the setting on every reload, which quietly
@@ -141,10 +152,46 @@ export async function autoloadModel() {
   // run it on until the user has loaded some scans anyway -- so it warms up in
   // the background and `activeModel()` waits for it if a run gets there first.
   STATE.modelLoading = true;
-  STATE.modelReady = onnx.setActiveBundle(bundle)
+  STATE.modelReady = onnx.setActiveBundle(bundle, id)
     .then(() => { STATE.modelLoading = false; STATE.modelError = null; })
     .catch((e) => { STATE.modelLoading = false; STATE.modelError = e.message; });
   return STATE.modelReady;
+}
+
+/**
+ * Switch to a different served network.
+ *
+ * Downloads it the first time and caches it per id, so going back and forth
+ * between the 2D and 3D models costs one download each and nothing after that.
+ */
+export async function setModelId(id, onProgress = null) {
+  const index = STATE.modelIndex;
+  const entry = index && index.models.find((m) => m.id === id);
+  if (!entry) throw new Error(`no served model called ${JSON.stringify(id)}`);
+  if (id === STATE.modelId && await onnx.activeModel()) return state();
+
+  STATE.modelLoading = true;
+  STATE.modelError = null;
+  try {
+    const bundle = await onnx.loadServedBundle(entry, './model/', onProgress);
+    if (!bundle) throw new Error(`${entry.label || id} is listed but not being served`);
+    const starting = onnx.setActiveBundle(bundle, id);
+    // `modelReady()` awaits whatever is in STATE.modelReady, possibly long
+    // after the fact. Park a promise that always settles, so a failure here
+    // surfaces once — as the throw below — rather than again every time
+    // something else asks whether the model is up.
+    STATE.modelReady = starting.catch(() => {});
+    await starting;
+    STATE.modelId = id;
+    STATE.modelAvailable = true;
+    await store.setKV('model_id', id);
+  } catch (e) {
+    STATE.modelError = e.message;
+    throw e;
+  } finally {
+    STATE.modelLoading = false;
+  }
+  return state();
 }
 
 /** Resolves when the model has finished starting (or failed to). */
@@ -156,12 +203,17 @@ export async function modelReady() {
 /** Load a model from files the user picked, for when it is not served. */
 export async function loadModelFromFiles(files) {
   const bundle = await onnx.bundleFromFiles(files);
-  await onnx.cacheBundle(bundle);
-  await onnx.setActiveBundle(bundle);
+  // A folder the user picked is its own model, keyed by what it says it is, so
+  // it neither overwrites nor is overwritten by anything the site serves.
+  const id = `local:${bundle.manifest.model?.config || 'model'}`;
+  await onnx.cacheBundle(bundle, id);
+  await onnx.setActiveBundle(bundle, id);
+  STATE.modelId = id;
   STATE.modelAvailable = true;
   STATE.modelError = null;
   STATE.model = 'onnx';
   await store.setKV('model', 'onnx');
+  await store.setKV('model_id', id);
   return onnx.activeModelInfo();
 }
 
@@ -177,11 +229,15 @@ export async function setModel(spec) {
 }
 
 export async function forgetModel() {
-  await onnx.clearCachedBundle();
+  const ids = (STATE.modelIndex ? STATE.modelIndex.models.map((m) => m.id) : [])
+    .concat(STATE.modelId ? [STATE.modelId] : []);
+  await onnx.clearAllCachedBundles(ids);
   onnx.forgetActiveModel();
   STATE.modelAvailable = false;
+  STATE.modelId = null;
   STATE.model = 'stub';
   await store.setKV('model', 'stub');
+  await store.setKV('model_id', null);
   return state();
 }
 

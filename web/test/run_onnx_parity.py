@@ -131,13 +131,29 @@ def main() -> int:
     ap.add_argument("--serve", action="store_true")
     ap.add_argument("--backend", default="", choices=["", "wasm", "webgpu"],
                     help="pin one execution provider instead of the best available")
+    ap.add_argument("--model", default="",
+                    help="which served model id to test; default is the one "
+                         "models.json names as the default")
     args = ap.parse_args()
 
-    if not os.path.exists(os.path.join(WEB, "model", "manifest.json")):
+    model_dir = os.path.join(WEB, "model")
+    index_path = os.path.join(model_dir, "models.json")
+    if os.path.exists(index_path):
+        index = json.load(open(index_path))
+        ids = [m["id"] for m in index["models"]]
+        wanted = args.model or index["default"]
+        if wanted not in ids:
+            raise SystemExit(f"--model {wanted} is not served; have {ids}")
+        print(f"served models: {', '.join(ids)}  ->  testing {wanted}")
+    elif os.path.exists(os.path.join(model_dir, "manifest.json")):
+        if args.model:
+            raise SystemExit("this deployment serves a single unnamed model, "
+                             "so --model does not apply")
+        wanted = ""
+    else:
         raise SystemExit(
-            f"no model at {os.path.join(WEB, 'model')}. Build one first "
-            f"(see the project's bundling script) -- there is nothing to test "
-            f"without it.")
+            f"no model at {model_dir}. Build one first (see the project's "
+            f"bundling script) -- there is nothing to test without it.")
 
     tmp = tempfile.mkdtemp(prefix="onnx_parity_")
     FIXTURES["dir"] = tmp
@@ -148,8 +164,11 @@ def main() -> int:
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{port}/test/onnx_parity.html"
-    if args.backend:
-        url += f"?backend={args.backend}"
+    q = [f"backend={args.backend}"] if args.backend else []
+    if wanted:
+        q.append(f"model={wanted}")
+    if q:
+        url += "?" + "&".join(q)
     print(f"serving {WEB} at http://127.0.0.1:{port}")
 
     proc = profile = None
