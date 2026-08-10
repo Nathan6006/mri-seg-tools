@@ -356,7 +356,7 @@ export class OnnxModel {
     this.backend = null;
   }
 
-  async init(force = null) {
+  async init(force = null, warmup = true) {
     assertCompatible(this.meta);
     const o = await ort();
 
@@ -367,20 +367,55 @@ export class OnnxModel {
 
     // `force` exists for the parity test, which needs to compare the backends
     // against each other rather than take whichever one the machine offers.
+    //
     const attempts = force ? [force] : [];
     if (!force) {
       if (await webgpuUsable()) attempts.push('webgpu');
       attempts.push('wasm');
     }
 
+    const build = (ep) => o.InferenceSession.create(this.bundle.graph, {
+      executionProviders: [ep],
+      graphOptimizationLevel: 'all',
+      externalData: external,
+    });
+
     let lastErr = null;
-    for (const ep of attempts) {
+    for (let i = 0; i < attempts.length; i++) {
+      const ep = attempts[i];
+      const isLast = i === attempts.length - 1;
       try {
-        this.session = await o.InferenceSession.create(this.bundle.graph, {
-          executionProviders: [ep],
-          graphOptimizationLevel: 'all',
-          externalData: external,
-        });
+        // A SESSION THAT BUILDS IS NOT A SESSION THAT RUNS. WebGPU accepts this
+        // 3D model's graph and then fails inside a kernel it does not
+        // implement -- "Unsupported padding parameter" -- but only once
+        // something is pushed through. Without a probe the model appears to
+        // load, the card says "loaded", and the first scan a reviewer runs
+        // throws.
+        //
+        // THE PROBE GETS ITS OWN SESSION, WHICH IS THEN THROWN AWAY. Reusing
+        // the probed session is not safe: running a dummy input through a
+        // WebGPU session and then a real one produced badly wrong masks --
+        // 4,641 foreground voxels where there should have been 31,749, and a
+        // small lesion lost entirely. That looked exactly like "half precision
+        // is unreliable" and was nothing of the kind; it was state left behind
+        // by the probe. A fresh session gives WebGPU's normal behaviour, which
+        // is a couple of dozen boundary voxels.
+        //
+        // Only non-final backends are probed automatically: there is nothing
+        // to fall back to after the last one, so a probe there would buy
+        // nothing and cost a whole forward pass -- seconds, for a 3D model.
+        // A PINNED backend is always probed, because the caller asked
+        // specifically whether that one works and deserves the answer at load
+        // rather than halfway through a scan.
+        if (warmup && (force || !isLast)) {
+          const probe = await build(ep);
+          try {
+            await this._probe(o, probe);
+          } finally {
+            await probe.release?.();
+          }
+        }
+        this.session = await build(ep);
         this.backend = ep;
         return this;
       } catch (err) {
@@ -388,10 +423,24 @@ export class OnnxModel {
         // WebGPU is the fast path but is newer and can fail on a driver or on
         // an op it does not implement. Falling through to wasm is slow but
         // always works, and is far better than refusing to run.
-        console.warn(`onnxruntime: ${ep} backend unavailable (${err.message})`);
+        console.warn(`onnxruntime: ${ep} backend unusable (${err.message})`);
+        this.session = null;
       }
     }
-    throw new Error(`could not start the model on any backend. Last error: ${lastErr?.message}`);
+    throw new Error(`could not run the model on any backend. Last error: ${lastErr?.message}`);
+  }
+
+  /** Push one empty patch through a throwaway session, to see if this backend works. */
+  async _probe(o, session) {
+    const patch = this.patch;
+    const t = new o.Tensor('float32',
+                           new Float32Array(patch.reduce((a, b) => a * b, 1)),
+                           [1, 1, ...patch]);
+    const res = await session.run({ [session.inputNames[0]]: t });
+    const out = res[session.outputNames[0]];
+    if (!out || !out.data || !out.data.length) {
+      throw new Error('the model produced no output on a probe pass');
+    }
   }
 
   get patch() { return this.meta.patch_size; }
@@ -671,8 +720,14 @@ export class OnnxModel {
           const dst = ((z0 + z) * Py + (y0 + y)) * Px + x0;
           for (let x = 0; x < px; x++) {
             const g = gauss[src + x];
-            acc[dst + x] += out[src + x] * g;
-            acc[vol3 + dst + x] += out[patchVox + src + x] * g;
+            // fround because the reference multiplies two float32 arrays and
+            // rounds the PRODUCT before adding. JavaScript would compute the
+            // product in double and round only on the store into acc — one
+            // rounding instead of two. That is a fraction of an ulp, and it
+            // flipped exactly one voxel out of 2.3 M where the two logits were
+            // otherwise tied. See the note above _segment3d.
+            acc[dst + x] += Math.fround(out[src + x] * g);
+            acc[vol3 + dst + x] += Math.fround(out[patchVox + src + x] * g);
             wsum[dst + x] += g;
           }
         }
@@ -687,8 +742,11 @@ export class OnnxModel {
         const drow = (z * ny + y) * nx;
         for (let x = 0; x < nx; x++) {
           const w = wsum[src + x];
-          const a = acc[src + x] / w;
-          const c = acc[vol3 + src + x] / w;
+          // fround for the same reason: the reference divides a float32 array
+          // in place, so the quotient is rounded to float32 before the argmax
+          // looks at it.
+          const a = Math.fround(acc[src + x] / w);
+          const c = Math.fround(acc[vol3 + src + x] / w);
           // Softmax of two logits, as a logistic on the difference so a large
           // logit cannot overflow the exponential.
           prob[drow + x] = 1 / (1 + Math.exp(a - c));
@@ -753,9 +811,9 @@ export class OnnxModel {
 }
 
 /** Build and start a model from whatever source is available. */
-export async function openModel(bundle, force = null) {
+export async function openModel(bundle, force = null, warmup = true) {
   const m = new OnnxModel(bundle);
-  await m.init(force);
+  await m.init(force, warmup);
   return m;
 }
 

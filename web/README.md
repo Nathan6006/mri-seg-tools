@@ -226,19 +226,51 @@ differently-shaped image.
 ### Speed, and the two backends
 
 WebGPU where it is available (Chrome and Edge), WebAssembly everywhere else,
-chosen automatically. On this hardware, a 18-slice scan with test-time
+chosen automatically. On this hardware, an 18-slice scan with test-time
 mirroring:
 
-| backend | per scan | agreement with the reference |
-|---|---|---|
-| WebGPU | ~2.4 s | a few voxels differ (half-precision GPU arithmetic) |
-| WebAssembly | ~21 s | **exact, 0 voxels** |
+| model | backend | per scan | agreement with the reference |
+|---|---|---|---|
+| 2D | WebGPU | ~2.4 s | 0 and 23 voxels on lesions of 48 and 31,749 |
+| 2D | WebAssembly | ~22 s | **exact, 0 voxels** |
+| 3D | WebAssembly | ~57 s | 1 voxel, and it is the network rather than the wrapper |
 
 The CPU path being bit-exact is what proves the wrapper is right. The GPU path
 computes in half precision with a different accumulation order, so a handful of
 voxels on the decision boundary land differently — arithmetic, not a defect,
 and far below anything that could matter. **For a number that goes in a paper,
 use the command-line pipeline, which is deterministic.**
+
+**There is no WebGPU row for the 3D model, and that is not an omission.**
+onnxruntime-web 1.20.1's WebGPU provider does not implement 3-D convolution
+with asymmetric padding — which is exactly what an anisotropy-aware 3-D U-Net
+emits — so a 3-D model runs on WebAssembly on every browser. Worse, the session
+*builds* on WebGPU and only fails inside the kernel, so `openModel` pushes one
+empty patch through a backend before accepting it.
+
+**That probe needs its own throwaway session, and finding out why was
+instructive.** Probing and then reusing the same WebGPU session produced badly
+wrong masks: 4,641 foreground voxels where there should have been 31,749, and a
+small lesion missed entirely. It looked precisely like "half precision is
+unreliable at the small end", which is a plausible enough story that it nearly
+went into this file as a finding. It was not true — it was state left behind by
+the probe. With a fresh session, WebGPU returns to a couple of dozen boundary
+voxels. Only non-final backends are probed, since there is nothing to fall back
+to after the last one and a probe there costs a whole forward pass for nothing.
+
+The moral is worth keeping: a diagnostic that runs before the thing it is
+diagnosing can *be* the defect, and "the GPU is imprecise" is a comfortable
+enough explanation to stop the search early.
+
+Getting the float32 rounding right matters here too. The reference
+implementation multiplies two float32 arrays and rounds the *product* before
+accumulating, then rounds the *quotient* before the argmax; JavaScript would do
+both in double and round once. Hence the `Math.fround` calls in the
+accumulation loop — they are not decoration, though they turned out not to be
+the cause of the single-voxel difference the CPU path still shows on one 3-D
+scan. That one is the network, not the wrapper: it appears in fp32 as well as
+fp16, and that scan contains exactly one voxel whose two class logits differ by
+0.013 against a range of ±19.
 
 Multi-threading needs the page to be cross-origin isolated (COOP + COEP). It
 still runs without that, on one thread and several times slower, which is why
@@ -288,7 +320,7 @@ end, including the parts node cannot run — IndexedDB, canvas, the real
 .venv/bin/python web/test/run_selftest.py --serve    # open it in any browser
 ```
 
-41 checks, from gzip to zip export. It builds its own DICOM files
+42 checks, from gzip to zip export. It builds its own DICOM files
 (`test/fixture.js`) so it involves no lab data and is safe to run anywhere —
 including with `--serve` on the machine of anyone who wants to know whether
 their browser is supported.

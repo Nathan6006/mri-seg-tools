@@ -83,7 +83,11 @@ export async function init(model) {
   // Pick up a trained model without being asked, from the cache or from one
   // served beside the page. A reviewer should not have to know the tool has a
   // model-loading step; they should only hear about it if there is no model.
-  await autoloadModel().catch((e) => { STATE.modelError = e.message; });
+  //
+  // Not awaited past the index lookup: `autoloadModel` parks the download and
+  // the graph build in STATE.modelReady, and `modelReady()` is how anything
+  // that actually needs the model waits for it.
+  autoloadModel().catch((e) => { STATE.modelError = e.message; });
   STATE.minVoxels = await store.getKV('minVoxels', 0);
   STATE.cases = await store.allCases();
   const p = await store.requestPersistence();
@@ -132,28 +136,38 @@ export async function autoloadModel() {
   // reviewer who deliberately switched to the 2D model should not be moved back
   // to the served default on every reload.
   const preferId = await store.getKV('model_id', null);
-  const { bundle, index, id } = await onnx.autoloadBundle('./model/', preferId);
+
+  // Only the INDEX is fetched here -- a few hundred bytes, enough to know
+  // whether a model exists and which one to want. Everything after it is tens
+  // of megabytes plus a graph build, and it happens in the background.
+  //
+  // This used to be awaited in full. With a 67 MB model that was a second or
+  // two; with an 89 MB 3D model it was long enough that the page sat blank and
+  // the self-test timed out waiting for the first paint. Nothing needs the
+  // model until a scan is loaded.
+  const index = await onnx.servedModelIndex('./model/');
   STATE.modelIndex = index;
-  STATE.modelId = id;
-  STATE.modelAvailable = !!bundle;
-  if (!bundle) return null;
-  if (id && id !== preferId) await store.setKV('model_id', id);
+  STATE.modelAvailable = !!index;
 
   // Default to the trained model, but never override a deliberate choice. The
   // first version of this reset the setting on every reload, which quietly
   // undid "use the stub" and "no mirroring" every time the page was opened.
-  if (!chosen) {
+  if (!chosen && index) {
     STATE.model = 'onnx';
     await store.setKV('model', 'onnx');
   }
 
-  // Building the session takes a couple of seconds. Doing it before the first
-  // paint would make the app look broken on startup, and there is nothing to
-  // run it on until the user has loaded some scans anyway -- so it warms up in
-  // the background and `activeModel()` waits for it if a run gets there first.
   STATE.modelLoading = true;
-  STATE.modelReady = onnx.setActiveBundle(bundle, id)
-    .then(() => { STATE.modelLoading = false; STATE.modelError = null; })
+  STATE.modelReady = (async () => {
+    const { bundle, id } = await onnx.autoloadBundle('./model/', preferId);
+    STATE.modelId = id;
+    STATE.modelAvailable = !!bundle;
+    if (!bundle) return null;
+    if (id && id !== preferId) await store.setKV('model_id', id);
+    await onnx.setActiveBundle(bundle, id);
+    return id;
+  })()
+    .then((id) => { STATE.modelLoading = false; STATE.modelError = id ? null : STATE.modelError; })
     .catch((e) => { STATE.modelLoading = false; STATE.modelError = e.message; });
   return STATE.modelReady;
 }
