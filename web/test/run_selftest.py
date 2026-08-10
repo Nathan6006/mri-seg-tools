@@ -75,7 +75,10 @@ def main() -> int:
                     help="run in a visible browser window instead of headless")
     ap.add_argument("--serve", action="store_true",
                     help="serve and wait; open the URL in whatever browser you like")
-    ap.add_argument("--timeout", type=int, default=180)
+    # Generous because two of the checks load a real model and run it. A 3D
+    # network on the WebAssembly backend is eight passes over a padded volume,
+    # which is tens of seconds on its own; the rest of the suite is milliseconds.
+    ap.add_argument("--timeout", type=int, default=600)
     args = ap.parse_args()
 
     port = free_port()

@@ -367,10 +367,16 @@
   <div class="card">
     <h2>Model</h2>
     <p class="hint" id="modelState">Checking…</p>
+    <!-- Which network. Hidden unless the site serves more than one, so a
+         single-model deployment looks exactly as it did before. -->
+    <div class="row" id="netPickRow" style="margin-top:10px;display:none">
+      <select id="netPick" class="grow" style="font-size:12px;padding:4px 8px"></select>
+    </div>
+    <p class="hint" id="netNote" style="margin-top:6px;display:none"></p>
     <div class="row" style="margin-top:10px">
       <select id="modelPick" class="grow" style="font-size:12px;padding:4px 8px">
         <option value="onnx">Trained model (with test-time mirroring)</option>
-        <option value="onnx:no-tta">Trained model — no mirroring (about 4× faster)</option>
+        <option value="onnx:no-tta">Trained model — no mirroring (faster)</option>
         <option value="stub">Stub (synthetic masks, for testing the tool)</option>
       </select>
     </div>

@@ -178,6 +178,31 @@ carries a SHA-256 of the whole thing, which is checked after the shards are
 rejoined. A truncated download fails loudly instead of loading a corrupted
 model.
 
+### More than one network
+
+A deployment can serve several. `model/models.json` lists them and names the
+default; each bundle lives in its own subfolder:
+
+```
+model/
+├── models.json          {"default": "3d_fullres", "models": [...]}
+├── 3d_fullres/          manifest.json, model.onnx, weights-*.bin
+└── 2d/                  the same, for the other configuration
+```
+
+A picker appears in the Model card when there is more than one, with a
+one-line note on what each is good and bad at. **Only the model in use is
+downloaded**, and each is cached separately, so switching costs one download
+and nothing after that. A single-model deployment — the older layout, with
+`manifest.json` at the top of `model/` — still works and shows no picker.
+
+This exists because a 2D and a 3D network trained on the same data usually
+differ more in *how* they fail than in how well they score. On the study this
+was built for, one gave better volumes and left occasional stray voxels on
+lesion-free scans while the other under-segmented systematically, and they
+missed different scans. Which to prefer is a judgement about the endpoint, so
+the tool offers both rather than deciding.
+
 ### What runs around the network
 
 `lib/onnx.js` does the preprocessing, and it is short on purpose:

@@ -633,10 +633,11 @@ export async function run() {
       const banner = doc.getElementById('stubBanner');
       const card = doc.getElementById('modelState');
 
-      // Starting a model session takes a moment, so the card is briefly
+      // Starting a model session takes a moment — fetching tens of megabytes
+      // and letting the runtime build its graph — so the card is briefly
       // "loading". Wait for it to settle rather than read it mid-flight.
       const t0 = performance.now();
-      while (card.dataset.state === 'loading' && performance.now() - t0 < 20000) {
+      while (card.dataset.state === 'loading' && performance.now() - t0 < 120000) {
         await new Promise((r) => setTimeout(r, 100));
       }
       const real = card.dataset.state === 'loaded';
@@ -646,11 +647,12 @@ export async function run() {
       // published without weights on purpose. If a model IS being served, it
       // has to have loaded.
       const onnx = await import('../lib/onnx.js');
-      const served = await onnx.servedModelManifest('../model/');
-      if (served) {
+      const index = await onnx.servedModelIndex('../model/');
+      if (index) {
         eq(card.dataset.state, 'loaded',
-           `a model is served at model/ (version ${served.version}) so it must load; ` +
-           `the card says "${card.textContent.trim().slice(0, 120)}"`);
+           `${index.models.length} model(s) are served at model/ (default ` +
+           `${index.default}) so one must load; the card says ` +
+           `"${card.textContent.trim().slice(0, 120)}"`);
       }
 
       if (real) {
@@ -685,10 +687,13 @@ export async function run() {
   await check('the trained model returns mask and probability on the scan grid',
     async () => {
       const onnx = await import('../lib/onnx.js');
-      const served = await onnx.servedModelManifest('../model/');
-      if (!served) return;                  // published without weights: nothing to check
+      const index = await onnx.servedModelIndex('../model/');
+      if (!index) return;                   // published without weights: nothing to check
       if (!await onnx.activeModel()) {
-        await onnx.setActiveBundle(await onnx.fetchBundle(served, '../model/'));
+        const entry = index.models.find((m) => m.id === index.default);
+        const base = `../model/${entry.path}`;
+        const mf = await onnx.servedModelManifest(base);
+        await onnx.setActiveBundle(await onnx.fetchBundle(mf, base), entry.id);
       }
       const pred = getPredictor('onnx');
       truthy(pred.isReal, 'the ONNX predictor reports itself as a real model');
@@ -720,6 +725,44 @@ export async function run() {
         }
       }
     });
+
+  /**
+   * Sliding-window origins, against values taken from the training framework.
+   *
+   * These are the shapes where `Math.round` gives the WRONG answer. The
+   * framework rounds half to even; JavaScript rounds half up; and a step that
+   * lands exactly on .5 is common, not exotic — across a sweep of 2,715
+   * (size, patch) pairs, 516 of them diverge. Each divergence shifts a whole
+   * window by one voxel, which produces a plausible mask that is quietly wrong
+   * near the seam.
+   *
+   * The study this was built for happens to have integer steps, so none of
+   * this bites there. It is here so that the next dataset does not have to
+   * find out.
+   */
+  await check('sliding-window origins round half to even, not half up', async () => {
+    const { windowStarts } = await import('../lib/onnx.js');
+    const table = [
+      // [size, patch, expected] -- verified against compute_steps_for_sliding_window
+      [13, 8, [0, 2, 5]],                 // Math.round: [0, 3, 5]
+      [21, 8, [0, 3, 6, 10, 13]],         //             [0, 3, 7, 10, 13]
+      [22, 8, [0, 4, 7, 10, 14]],         //             [0, 4, 7, 11, 14]
+      [29, 8, [0, 4, 7, 10, 14, 18, 21]], //             [0, 4, 7, 11, 14, 18, 21]
+      // and the shapes this project actually sees, where the steps are integers
+      [18, 20, null], [20, 20, [0]], [22, 20, [0, 2]], [24, 20, [0, 4]],
+      [26, 20, [0, 6]], [30, 20, [0, 10]], [256, 256, [0]],
+    ];
+    for (const [size, patch, want] of table) {
+      if (want === null) {          // shorter than the patch: must refuse, not guess
+        let threw = false;
+        try { windowStarts(size, patch, 0.5); } catch { threw = true; }
+        truthy(threw, `windowStarts(${size}, ${patch}) must refuse an unpadded axis`);
+        continue;
+      }
+      const got = windowStarts(size, patch, 0.5);
+      eq(got.join(','), want.join(','), `windowStarts(${size}, ${patch}, 0.5)`);
+    }
+  });
 
   await check('a model bundle is rejected if its weights do not match the manifest',
     async () => {

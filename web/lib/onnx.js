@@ -32,9 +32,29 @@
  *
  * What remains is:
  *
- *     z-score over the whole volume -> centre-pad each slice to the patch ->
- *     network -> average logits over the mirrorings -> softmax -> argmax ->
- *     crop the padding back off
+ *   2D model:  z-score the whole volume -> centre-pad each slice to the patch
+ *              -> network -> average logits over 4 mirrorings -> softmax ->
+ *              argmax -> crop the padding back off
+ *
+ *   3D model:  z-score the whole volume -> centre-pad the volume to at least
+ *              the patch -> for each sliding window: network, average logits
+ *              over 8 mirrorings, accumulate weighted by a Gaussian ->
+ *              divide by the accumulated weight -> argmax -> crop back
+ *
+ * The 3D path has two extra pieces, and neither is invented here:
+ *
+ *   - The sliding window. Almost every scan in a study like this is shorter
+ *     than the patch in the through-plane direction, so there is one window and
+ *     the whole mechanism collapses to "run the network once". It exists for
+ *     the occasional scan acquired with extended coverage, and the window
+ *     origins are computed with the same arithmetic the training framework uses
+ *     (including its round-half-to-even, which JavaScript's Math.round is not).
+ *
+ *   - The Gaussian importance map, which weights a window's centre above its
+ *     edges where windows overlap. The framework builds it by filtering a delta,
+ *     which is exactly separable, so the exporter ships three 1-D vectors and
+ *     this file takes their outer product. With a single window it cancels out
+ *     of the division entirely.
  */
 
 import * as store from './store.js';
@@ -84,7 +104,9 @@ async function webgpuUsable() {
 // Getting the weights into the tab
 // ---------------------------------------------------------------------------
 
-const CACHE_KEY = 'model.bundle';
+// One cache entry per model, because more than one can be served and switching
+// between them should not mean re-downloading the one you just left.
+const cacheKey = (id) => `model.bundle.${id || 'default'}`;
 
 async function sha256Hex(bytes) {
   const d = await crypto.subtle.digest('SHA-256', bytes);
@@ -92,13 +114,40 @@ async function sha256Hex(bytes) {
 }
 
 /**
- * Is a model being served alongside the page?
+ * Which models are served alongside the page, and which is the default?
  *
- * The weights are a derivative of the study's imaging, so whether they are
- * published with the site is a decision for whoever owns the data. The tool
- * therefore supports both: served from `model/` if it is there, or handed over
- * from a local folder by the user. This is how it finds out which.
+ * The weights are a derivative of whatever imaging the model was trained on, so
+ * whether they are published with the site is a decision for whoever owns the
+ * data. The tool therefore supports both: served from `model/` if it is there,
+ * or handed over from a local folder by the user. This is how it finds out.
+ *
+ * A deployment can serve several models — a 2D and a 3D network usually differ
+ * more in *how* they fail than in how well they score, so being able to switch
+ * is worth more than picking a winner. Older deployments served exactly one, as
+ * a bare `model/manifest.json`; that layout is still understood and appears as
+ * a single unnamed entry.
  */
+export async function servedModelIndex(base = './model/') {
+  try {
+    const res = await fetch(`${base}models.json`, { cache: 'no-cache' });
+    if (res.ok) {
+      const idx = await res.json();
+      if (idx && Array.isArray(idx.models) && idx.models.length) {
+        const ids = idx.models.map((m) => m.id);
+        return {
+          default: ids.includes(idx.default) ? idx.default : ids[0],
+          models: idx.models.map((m) => ({ ...m, path: m.path || `${m.id}/` })),
+        };
+      }
+    }
+  } catch { /* fall through to the single-model layout */ }
+
+  const one = await servedModelManifest(base);
+  if (!one) return null;
+  return { default: 'model', models: [{ id: 'model', path: '', label: 'Trained model' }] };
+}
+
+/** The manifest for one served model, or null if there is not one there. */
 export async function servedModelManifest(base = './model/') {
   try {
     const res = await fetch(`${base}manifest.json`, { cache: 'no-cache' });
@@ -181,26 +230,78 @@ export async function bundleFromFiles(fileList) {
   return { manifest, graph, weights };
 }
 
-export async function cachedBundle() {
-  const rec = await store.getKV(CACHE_KEY, null);
+export async function cachedBundle(id = null) {
+  const rec = await store.getKV(cacheKey(id), null);
   if (!rec || !rec.manifest || !rec.graph || !rec.weights) return null;
   return rec;
 }
 
-export async function cacheBundle(bundle) {
-  // 67 MB of weights in one IndexedDB value. Storing them as one blob rather
-  // than per-shard keeps the read path a single get, and the download is the
-  // slow part anyway.
-  await store.setKV(CACHE_KEY, bundle);
+export async function cacheBundle(bundle, id = null) {
+  // Tens of megabytes of weights in one IndexedDB value. Storing them as one
+  // blob rather than per-shard keeps the read path a single get, and the
+  // download is the slow part anyway.
+  await store.setKV(cacheKey(id), bundle);
 }
 
-export async function clearCachedBundle() {
-  await store.setKV(CACHE_KEY, null);
+export async function clearCachedBundle(id = null) {
+  await store.setKV(cacheKey(id), null);
+}
+
+/** Drop every cached model, whichever ids happen to be present. */
+export async function clearAllCachedBundles(ids = []) {
+  const all = new Set([null, 'model', ...ids]);
+  for (const id of all) await store.setKV(cacheKey(id), null);
 }
 
 // ---------------------------------------------------------------------------
 // The model
 // ---------------------------------------------------------------------------
+
+/**
+ * numpy's `round`, which is half-to-even, not JavaScript's half-up.
+ *
+ * The window origins are `round(step * i)` and a half-integer step is entirely
+ * possible, so the two rules can disagree by one voxel — which would shift a
+ * whole window. Everything else here is integer arithmetic; this is the one
+ * place the difference can bite.
+ */
+function rint(v) {
+  const f = Math.floor(v);
+  const d = v - f;
+  if (d > 0.5) return f + 1;
+  if (d < 0.5) return f;
+  return f % 2 === 0 ? f : f + 1;
+}
+
+/**
+ * Every subset of the allowed mirror axes, as [flipZ, flipY, flipX].
+ *
+ * This is what `itertools.combinations` over the axes enumerates: 8 passes for
+ * axes (0,1,2), 4 for (0,1), and exactly one — the identity — when mirroring is
+ * off. Order does not matter because the results are summed.
+ */
+function mirrorFlags(mirrorAxes) {
+  const axes = [0, 1, 2].filter((a) => mirrorAxes.includes(a));
+  const out = [];
+  for (let m = 0; m < (1 << axes.length); m++) {
+    const f = [false, false, false];
+    axes.forEach((a, i) => { if (m & (1 << i)) f[a] = true; });
+    out.push(f);
+  }
+  return out;
+}
+
+/** Window origins along one axis — `compute_steps_for_sliding_window`. */
+export function windowStarts(size, patch, stepSize) {
+  if (size < patch) throw new Error(`axis of ${size} is smaller than the patch ${patch}; pad first`);
+  const target = patch * stepSize;
+  const n = Math.ceil((size - patch) / target) + 1;
+  if (n <= 1) return [0];
+  const actual = (size - patch) / (n - 1);
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(rint(actual * i));
+  return out;
+}
 
 function assertCompatible(meta) {
   if (meta.resample) {
@@ -218,6 +319,31 @@ function assertCompatible(meta) {
   if (meta.num_classes !== 2) {
     throw new Error(`this tool handles one foreground label; the model has ` +
                     `${meta.num_classes} classes`);
+  }
+  const dim = meta.dim || 2;
+  if (dim !== 2 && dim !== 3) {
+    throw new Error(`unsupported model dimensionality ${dim}`);
+  }
+  if ((meta.patch_size || []).length !== dim) {
+    throw new Error(`a ${dim}D model should have a ${dim}-element patch size, ` +
+                    `got ${JSON.stringify(meta.patch_size)}`);
+  }
+  if (dim === 3) {
+    // Without these the sliding window would silently run unweighted, which is
+    // correct for one window and wrong for two — the worst kind of bug, since
+    // it would pass on 97% of scans.
+    if (!Array.isArray(meta.gaussian_1d) || meta.gaussian_1d.length !== 3) {
+      throw new Error('3D model is missing its gaussian_1d vectors; re-export it');
+    }
+    meta.gaussian_1d.forEach((v, i) => {
+      if (v.length !== meta.patch_size[i]) {
+        throw new Error(`gaussian_1d[${i}] has ${v.length} entries but the patch ` +
+                        `axis is ${meta.patch_size[i]}`);
+      }
+    });
+    if (!(meta.tile_step_size > 0 && meta.tile_step_size <= 1)) {
+      throw new Error(`tile_step_size ${meta.tile_step_size} is not in (0, 1]`);
+    }
   }
 }
 
@@ -270,6 +396,52 @@ export class OnnxModel {
 
   get patch() { return this.meta.patch_size; }
 
+  get dim() { return this.meta.dim || 2; }
+
+  /**
+   * The 3D importance map, as the outer product of the exported 1-D vectors.
+   *
+   * Built once and kept: it is patch-sized (about 1.3 M floats here) and is
+   * reused by every window of every scan.
+   */
+  gaussian() {
+    if (this._gauss) return this._gauss;
+    const [pz, py, px] = this.patch;
+    const [gz, gy, gx] = this.meta.gaussian_1d;
+    const floor = this.meta.gaussian_floor || 0;
+    const g = new Float32Array(pz * py * px);
+    for (let z = 0; z < pz; z++) {
+      for (let y = 0; y < py; y++) {
+        const row = (z * py + y) * px;
+        const zy = gz[z] * gy[y];
+        for (let x = 0; x < px; x++) g[row + x] = Math.max(zy * gx[x], floor);
+      }
+    }
+    this._gauss = g;
+    return g;
+  }
+
+  /**
+   * Mean and standard deviation over the whole stack.
+   *
+   * Not per slice: the plan normalises per image, and doing it per slice would
+   * rescale every slice differently and change what the network sees.
+   *
+   * Accumulating in JS numbers means these are computed in double precision,
+   * which is if anything more accurate than the float32 the training-time
+   * preprocessing used. The difference is ~1e-7 relative and cannot move a
+   * z-score meaningfully.
+   */
+  _stats(data) {
+    const n = data.length;
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += data[i];
+    const mean = sum / n;
+    let ss = 0;
+    for (let i = 0; i < n; i++) { const d = data[i] - mean; ss += d * d; }
+    return { mean, std: Math.max(Math.sqrt(ss / n), 1e-8) };
+  }
+
   /**
    * z-score the whole volume and centre-pad each slice to the patch size.
    *
@@ -287,16 +459,10 @@ export class OnnxModel {
     const [ph, pw] = this.patch;
     if (ny > ph || nx > pw) {
       throw new Error(`a ${ny}x${nx} slice does not fit the model's ${ph}x${pw} ` +
-                      `patch. This build runs one window per slice and has no ` +
+                      `patch. The 2D path runs one window per slice and has no ` +
                       `sliding-window path.`);
     }
-    const n = data.length;
-    let sum = 0;
-    for (let i = 0; i < n; i++) sum += data[i];
-    const mean = sum / n;
-    let ss = 0;
-    for (let i = 0; i < n; i++) { const d = data[i] - mean; ss += d * d; }
-    const std = Math.max(Math.sqrt(ss / n), 1e-8);
+    const { mean, std } = this._stats(data);
 
     const y0 = (ph - ny) >> 1;
     const x0 = (pw - nx) >> 1;
@@ -310,6 +476,34 @@ export class OnnxModel {
       }
     }
     return { input: out, y0, x0 };
+  }
+
+  /**
+   * z-score the whole volume and centre-pad it to at least the patch size.
+   *
+   * Padding is centred, and where the total is odd the larger half goes
+   * *after* — matching `pad_nd_image`. Getting that backwards shifts the whole
+   * mask by one voxel, which looks like nothing and is wrong everywhere.
+   *
+   * An axis already at or above the patch size is left alone: `new_shape` is a
+   * new *minimum*, and the sliding window covers whatever is longer.
+   */
+  preprocess3d(vol) {
+    const { nx, ny, nz, data } = vol;
+    const [pz, py, px] = this.patch;
+    const { mean, std } = this._stats(data);
+
+    const Pz = Math.max(nz, pz), Py = Math.max(ny, py), Px = Math.max(nx, px);
+    const z0 = (Pz - nz) >> 1, y0 = (Py - ny) >> 1, x0 = (Px - nx) >> 1;
+    const out = new Float32Array(Pz * Py * Px);          // zeros = padding
+    for (let z = 0; z < nz; z++) {
+      for (let y = 0; y < ny; y++) {
+        const src = (z * ny + y) * nx;
+        const dst = ((z + z0) * Py + (y + y0)) * Px + x0;
+        for (let x = 0; x < nx; x++) out[dst + x] = (data[src + x] - mean) / std;
+      }
+    }
+    return { input: out, shape: [Pz, Py, Px], off: [z0, y0, x0] };
   }
 
   /**
@@ -371,10 +565,152 @@ export class OnnxModel {
   }
 
   /**
+   * One sliding window through the network, averaged over the mirrorings.
+   *
+   * `win` is a single patch, already extracted. Returns the two logit volumes
+   * concatenated, patch-shaped, in the original (unflipped) orientation.
+   */
+  async _runWindow3d(o, win, mirrorAxes, onPass = null) {
+    const [pz, py, px] = this.patch;
+    const vox = pz * py * px;
+    const flags = mirrorFlags(mirrorAxes);
+
+    const acc = new Float32Array(2 * vox);
+    const inName = this.session.inputNames[0];
+    // One scratch buffer for all eight passes rather than eight allocations of
+    // several megabytes. Safe because the tensor wraps it without copying and
+    // `run` is awaited before the next pass overwrites it.
+    const buf = new Float32Array(vox);
+
+    for (const [fz, fy, fx] of flags) {
+      let fed = win;
+      if (fz || fy || fx) {
+        for (let z = 0; z < pz; z++) {
+          const sz = fz ? pz - 1 - z : z;
+          for (let y = 0; y < py; y++) {
+            const sy = fy ? py - 1 - y : y;
+            const d = (z * py + y) * px, s = (sz * py + sy) * px;
+            if (fx) for (let x = 0; x < px; x++) buf[d + x] = win[s + px - 1 - x];
+            else buf.set(win.subarray(s, s + px), d);
+          }
+        }
+        fed = buf;
+      }
+      const t = new o.Tensor('float32', fed, [1, 1, pz, py, px]);
+      const res = await this.session.run({ [inName]: t });
+      const logits = res[this.session.outputNames[0]].data;
+
+      // Unflip on the way back, so every mirroring is accumulated in the
+      // original orientation before being summed.
+      for (let c = 0; c < 2; c++) {
+        const base = c * vox;
+        for (let z = 0; z < pz; z++) {
+          const sz = fz ? pz - 1 - z : z;
+          for (let y = 0; y < py; y++) {
+            const sy = fy ? py - 1 - y : y;
+            const d = base + (z * py + y) * px, s = base + (sz * py + sy) * px;
+            if (fx) for (let x = 0; x < px; x++) acc[d + x] += logits[s + px - 1 - x];
+            else for (let x = 0; x < px; x++) acc[d + x] += logits[s + x];
+          }
+        }
+      }
+      if (onPass) onPass();
+    }
+    for (let i = 0; i < acc.length; i++) acc[i] /= flags.length;
+    return acc;
+  }
+
+  /**
+   * Sliding-window segmentation for a 3D model.
+   *
+   * Logits are accumulated weighted by the Gaussian and divided by the summed
+   * weight at the end. With one window that division cancels exactly, which is
+   * why this reduces to "run the network once" for a scan shorter than the
+   * patch — the common case by a wide margin.
+   */
+  async _segment3d(vol, { tta = true, onProgress = null } = {}) {
+    const o = await ort();
+    const { nx, ny, nz } = vol;
+    const [pz, py, px] = this.patch;
+    const { input, shape, off } = this.preprocess3d(vol);
+    const [Pz, Py, Px] = shape;
+    const [oz, oy, ox] = off;
+    const mirrorAxes = tta ? (this.meta.mirror_axes || []) : [];
+    const step = this.meta.tile_step_size;
+
+    const zs = windowStarts(Pz, pz, step);
+    const ys = windowStarts(Py, py, step);
+    const xs = windowStarts(Px, px, step);
+    const nWin = zs.length * ys.length * xs.length;
+    // One network pass is the unit of progress. A whole-stack scan is one
+    // window, so counting windows would show 0% and then 100%.
+    const nPass = nWin * mirrorFlags(mirrorAxes).length;
+
+    const patchVox = pz * py * px;
+    const vol3 = Pz * Py * Px;
+    const acc = new Float32Array(2 * vol3);
+    const wsum = new Float32Array(vol3);
+    const gauss = this.gaussian();
+    const win = new Float32Array(patchVox);
+
+    let pass = 0;
+    const tick = onProgress ? () => onProgress(++pass, nPass) : null;
+
+    for (const z0 of zs) for (const y0 of ys) for (const x0 of xs) {
+      for (let z = 0; z < pz; z++) {
+        for (let y = 0; y < py; y++) {
+          const s = ((z0 + z) * Py + (y0 + y)) * Px + x0;
+          win.set(input.subarray(s, s + px), (z * py + y) * px);
+        }
+      }
+      const out = await this._runWindow3d(o, win, mirrorAxes, tick);
+
+      for (let z = 0; z < pz; z++) {
+        for (let y = 0; y < py; y++) {
+          const src = (z * py + y) * px;
+          const dst = ((z0 + z) * Py + (y0 + y)) * Px + x0;
+          for (let x = 0; x < px; x++) {
+            const g = gauss[src + x];
+            acc[dst + x] += out[src + x] * g;
+            acc[vol3 + dst + x] += out[patchVox + src + x] * g;
+            wsum[dst + x] += g;
+          }
+        }
+      }
+    }
+
+    const prob = new Float32Array(nx * ny * nz);
+    const mask = new Uint8Array(nx * ny * nz);
+    for (let z = 0; z < nz; z++) {
+      for (let y = 0; y < ny; y++) {
+        const src = ((z + oz) * Py + (y + oy)) * Px + ox;
+        const drow = (z * ny + y) * nx;
+        for (let x = 0; x < nx; x++) {
+          const w = wsum[src + x];
+          const a = acc[src + x] / w;
+          const c = acc[vol3 + src + x] / w;
+          // Softmax of two logits, as a logistic on the difference so a large
+          // logit cannot overflow the exponential.
+          prob[drow + x] = 1 / (1 + Math.exp(a - c));
+          // argmax, not p >= 0.5 — they agree for two classes, and argmax is
+          // what the training framework does.
+          mask[drow + x] = c > a ? 1 : 0;
+        }
+      }
+    }
+    return { prob, mask };
+  }
+
+  /**
    * Segment a volume. Returns foreground probability and the argmax label,
    * both on the input grid.
    */
-  async segment(vol, { tta = true, batch = 8, onProgress = null } = {}) {
+  async segment(vol, opts = {}) {
+    if (this.dim === 3) return this._segment3d(vol, opts);
+    return this._segment2d(vol, opts);
+  }
+
+  async _segment2d(vol, { tta = true, batch = 8, onProgress = null } = {}) {
     const o = await ort();
     const { nx, ny, nz } = vol;
     const [ph, pw] = this.patch;
@@ -432,12 +768,16 @@ export async function openModel(bundle, force = null) {
 // unusable, so exactly one model is held here for the life of the page.
 let _active = null;
 let _loading = null;
+let _activeId = null;
 
-export async function setActiveBundle(bundle) {
+export async function setActiveBundle(bundle, id = null) {
   _active = null;
+  _activeId = id;
   _loading = openModel(bundle).then((m) => { _active = m; return m; });
   return _loading;
 }
+
+export function activeModelId() { return _activeId; }
 
 export async function activeModel() {
   if (_active) return _active;
@@ -448,6 +788,7 @@ export async function activeModel() {
 export function activeModelInfo() {
   if (!_active) return null;
   return {
+    id: _activeId,
     version: _active.manifest.version,
     precision: _active.manifest.precision,
     backend: _active.backend,
@@ -459,25 +800,44 @@ export function activeModelInfo() {
 export function forgetActiveModel() {
   _active = null;
   _loading = null;
+  _activeId = null;
+}
+
+/**
+ * Fetch one served model by id, preferring the cached copy.
+ *
+ * A served model whose version differs from the cached one wins, or a
+ * redeployed model would never reach anyone who had already used the tool.
+ */
+export async function loadServedBundle(entry, base = './model/', onProgress = null) {
+  const sub = `${base}${entry.path}`;
+  const cached = await cachedBundle(entry.id);
+  const served = await servedModelManifest(sub);
+  if (cached && (!served || served.version === cached.manifest.version)) return cached;
+  if (!served) return cached;
+  const bundle = await fetchBundle(served, sub, onProgress);
+  await cacheBundle(bundle, entry.id);
+  return bundle;
 }
 
 /**
  * Find a model without asking the user: the cache first, then one served
- * beside the page. Returns the bundle, or null if neither is there.
+ * beside the page. Returns `{ bundle, index, id }`, with a null bundle if
+ * nothing is available and the user has to supply a folder.
  */
-export async function autoloadBundle(base = './model/') {
-  const cached = await cachedBundle();
-  const served = await servedModelManifest(base);
-
-  // A served model that is newer than the cached one should win, or a
-  // redeployed model would never reach anyone who had already used the tool.
-  if (cached && (!served || served.version === cached.manifest.version)) {
-    return cached;
+export async function autoloadBundle(base = './model/', preferId = null) {
+  const index = await servedModelIndex(base);
+  if (!index) {
+    // Nothing served. A previous session may still have cached one, either
+    // under a served id or from a folder the user picked.
+    for (const id of [preferId, null, 'model']) {
+      const c = await cachedBundle(id);
+      if (c) return { bundle: c, index: null, id };
+    }
+    return { bundle: null, index: null, id: null };
   }
-  if (served) {
-    const bundle = await fetchBundle(served, base);
-    await cacheBundle(bundle);
-    return bundle;
-  }
-  return cached;
+  const wanted = index.models.find((m) => m.id === preferId)
+    || index.models.find((m) => m.id === index.default)
+    || index.models[0];
+  return { bundle: await loadServedBundle(wanted, base), index, id: wanted.id };
 }

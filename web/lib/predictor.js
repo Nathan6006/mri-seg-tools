@@ -337,7 +337,11 @@ export class OnnxPredictor extends Predictor {
       throw new Error('no model is loaded. Load one in Settings, or the tool ' +
                       'will keep running on the stub.');
     }
-    this.name = `onnx:${model.manifest.version} (${model.backend})`;
+    // The recorded name goes into results.json, which is what someone reads
+    // months later to work out what produced a mask — so it names the
+    // configuration, not just a digest.
+    const cfg = model.meta?.config || `${model.dim}d`;
+    this.name = `onnx:${cfg}:${model.manifest.version} (${model.backend})`;
     const { prob, mask } = await model.segment(vol, {
       tta: this.tta, onProgress: opts.onProgress,
     });
@@ -352,7 +356,12 @@ export class OnnxPredictor extends Predictor {
  *     "stub:empty"      always predicts tumour-free
  *     "stub:sphere"     one fixed centred blob, for exact assertions
  *     "onnx"            the trained model, if one has been loaded
- *     "onnx:no-tta"     the same, without test-time mirroring (about 4x faster)
+ *     "onnx:no-tta"     the same, without test-time mirroring
+ *
+ * Which *network* is loaded is a separate question, handled by `onnx.js` and
+ * the model picker — this only decides how it is driven. A 3D model mirrors
+ * over three axes rather than two, so turning mirroring off saves 8 passes
+ * instead of 4.
  */
 export function getPredictor(spec) {
   if (spec == null || spec === 'stub') return new StubPredictor('varied');

@@ -37,24 +37,39 @@ async function main() {
   say(`cross-origin isolated: ${self.crossOriginIsolated} ` +
       `(threads ${self.crossOriginIsolated ? 'enabled' : 'disabled'})`);
 
-  const manifest = await onnx.servedModelManifest('/model/');
-  if (!manifest) {
+  // ?model=<id> picks one of several served networks; without it the site's
+  // own default is tested, which is what a visitor would get.
+  const params = new URLSearchParams(location.search);
+  const index = await onnx.servedModelIndex('/model/');
+  if (!index) {
     say('no model served at /model/ — nothing to check', 'bad');
     await report({ error: 'no model at /model/' });
     return;
   }
-  say(`model ${manifest.version}, ${manifest.precision}, ` +
-      `${(manifest.weights_bytes / 1e6).toFixed(0)} MB in ${manifest.shards.length} shards`);
+  const wantId = params.get('model') || index.default;
+  const entry = index.models.find((m) => m.id === wantId);
+  if (!entry) {
+    const have = index.models.map((m) => m.id).join(', ');
+    say(`no served model "${wantId}" — have ${have}`, 'bad');
+    await report({ error: `no served model ${wantId}; have ${have}` });
+    return;
+  }
+  const base = `/model/${entry.path}`;
+  const manifest = await onnx.servedModelManifest(base);
+  say(`model ${entry.id} (${entry.label || ''}) ${manifest.version}, ` +
+      `${manifest.precision}, ${(manifest.weights_bytes / 1e6).toFixed(0)} MB ` +
+      `in ${manifest.shards.length} shards`);
 
   const tFetch = performance.now();
-  const bundle = await onnx.fetchBundle(manifest, '/model/');
+  const bundle = await onnx.fetchBundle(manifest, base);
   say(`weights fetched and checksum verified in ${((performance.now() - tFetch) / 1000).toFixed(1)}s`);
 
   const tInit = performance.now();
   // ?backend=wasm / ?backend=webgpu pins one, so the two can be compared.
-  const force = new URLSearchParams(location.search).get('backend');
-  const model = await onnx.openModel(bundle, force);
+  const model = await onnx.openModel(bundle, params.get('backend'));
   say(`session started on "${model.backend}" in ${((performance.now() - tInit) / 1000).toFixed(1)}s`);
+  say(`${model.dim}D model, patch ${model.patch.join('x')}, ` +
+      `mirror axes [${(model.meta.mirror_axes || []).join(',')}]`);
 
   const results = [];
   let totalDiff = 0, totalVox = 0;
@@ -89,6 +104,8 @@ async function main() {
   await report({
     backend: model.backend,
     crossOriginIsolated: self.crossOriginIsolated,
+    modelId: entry.id,
+    dim: model.dim,
     version: manifest.version,
     precision: manifest.precision,
     results,
