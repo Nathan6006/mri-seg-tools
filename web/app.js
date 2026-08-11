@@ -2013,9 +2013,11 @@ let FOLDER = {supported:false, linked:false, name:null};
 /* One step further, when it is available: serve.py started with
    `--itksnap <folder>` exposes a same-origin endpoint that launches ITK-SNAP
    on a case already written to that folder. The page only ever sends a case
-   NAME; the server decides what may be opened. On the deployed site the
-   endpoint does not exist and this probe fails silently, which is the
-   detection mechanism, not an error. */
+   NAME; the server decides what may be opened. On a deployed host the
+   endpoint does not exist, and either failure shape lands in the same place:
+   a plain 404, or Cloudflare Pages' SPA fallback answering 200 with
+   index.html, where r.json() throws instead. Both are the detection
+   mechanism, not an error -- verified against the live deployment. */
 let HELPER = {available:false, dir:null};
 
 async function probeHelper(){
