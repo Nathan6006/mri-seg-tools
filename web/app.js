@@ -1716,10 +1716,27 @@ function renderDetail(){
      linked folder if there is one, otherwise as a zip to unpack. Both end with
      the same workspace file, which is verified to resolve its layers when
      opened from the folder it sits in. */
+  itkButtonLabel();
   $('#btnItk').onclick = async () => {
     try{
       if(FOLDER.linked){
         const j = await Backend.exportToFolder([SEL]);
+        // With the serve.py helper running, go one step further and open it.
+        if(HELPER.available){
+          const r = await fetch('itksnap/open', {method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({case: SEL})});
+          const jj = await r.json().catch(() => ({}));
+          if(r.ok){
+            $('#itkMsg').innerHTML =
+              `<div class="meta">Opened in ITK-SNAP. Correct the mask, save it `
+              + `(<kbd>⌘S</kbd>), then press <strong>Check folder for edits</strong>.</div>`;
+            toast('Opened in ITK-SNAP');
+            return;
+          }
+          toast(jj.error || `The helper could not open it (HTTP ${r.status})`, true);
+          // Fall through to the written-to-folder message: the files are there.
+        }
         $('#itkMsg').innerHTML =
           `<div class="meta">Written to <code>${j.folder}/${SEL}/</code>. Open `
           + `<code>${fileNames(SEL).workspace}</code> there in ITK-SNAP, correct the `
@@ -1993,8 +2010,31 @@ $('#btnWipe').onclick = async () => {
    button hides itself rather than offering something that cannot work. */
 let FOLDER = {supported:false, linked:false, name:null};
 
+/* One step further, when it is available: serve.py started with
+   `--itksnap <folder>` exposes a same-origin endpoint that launches ITK-SNAP
+   on a case already written to that folder. The page only ever sends a case
+   NAME; the server decides what may be opened. On the deployed site the
+   endpoint does not exist and this probe fails silently, which is the
+   detection mechanism, not an error. */
+let HELPER = {available:false, dir:null};
+
+async function probeHelper(){
+  try{
+    const r = await fetch('itksnap/status', {cache:'no-store'});
+    const j = r.ok ? await r.json() : null;
+    HELPER = j && j.helper ? {available:true, dir:j.dir} : {available:false, dir:null};
+  }catch{ HELPER = {available:false, dir:null}; }
+}
+
+function itkButtonLabel(){
+  const b = $('#btnItk');
+  if(b) b.textContent = (FOLDER.linked && HELPER.available)
+    ? 'Open in ITK-SNAP' : 'Download for ITK-SNAP';
+}
+
 async function refreshFolder(){
   FOLDER = await Backend.folderStatus();
+  itkButtonLabel();
   const b = $('#btnFolder');
   if(!b) return;
   b.style.display = FOLDER.supported ? '' : 'none';
@@ -2198,6 +2238,7 @@ function unsupported(){
   }
   try{
     await Backend.init();
+    await probeHelper();
     await refreshFolder();
     await refresh();
     // The model finishes starting later — seconds on a cached copy, minutes on

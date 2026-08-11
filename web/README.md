@@ -129,6 +129,40 @@ That is the Flask build's shared-results-folder behaviour, restored. Firefox and
 Safari have not shipped `showDirectoryPicker`, so there the button hides itself
 and the zip route is used instead — it works everywhere and always did.
 
+### One step further, running locally: the launch helper
+
+The page cannot start a program, but `serve.py` can — it is a process you
+started. Point it at the same folder the browser is linked to:
+
+```bash
+python3 web/serve.py --itksnap ~/mri-review
+```
+
+and *Download for ITK-SNAP* becomes **Open in ITK-SNAP**: the case is written
+to the folder exactly as before, and then the server launches ITK-SNAP on the
+workspace. Edit, save, press *Check folder for edits*. One click replaces the
+find-the-folder-and-open-the-file step, which is most of the friction in
+screening a queue of cases.
+
+The trust boundary stays where it was: the page only ever sends a case *name*;
+the server refuses anything that does not resolve to a directory inside the
+`--itksnap` folder, refuses cross-origin requests, and can only ever open a
+`.itksnap` file found there. On a deployed host the endpoint does not exist,
+the startup probe fails silently, and the button stays *Download for ITK-SNAP*.
+
+Two implementation notes, both learned the hard way:
+
+* The launch is `ITK-SNAP -w <workspace>` — the documented CLI. `open -a
+  ITK-SNAP <file>` on macOS starts the app but **silently drops the document**
+  (the same unregistered-UTI problem that breaks double-clicking, above), which
+  looks exactly like it worked until you notice no image is loaded.
+* The binary is found via `$ITKSNAP`, then `PATH`, then the standard macOS app
+  location, and `serve.py` refuses to start the helper if none exists — a
+  button that fails on first click is worse than no button.
+
+Each click opens a fresh ITK-SNAP instance, which is what you want when
+comparing two cases and no worse than *File > Open Workspace* when not.
+
 An existing working mask in the folder is never overwritten by re-exporting a
 case, and a mask that comes back byte-identical is a no-op: `corrected_at` does
 not move. That second one matters because the folder is re-read in full on every
@@ -406,7 +440,8 @@ web/
 ├── index.html          the page: markup and styles
 ├── app.js              the viewer, editor and review flow
 ├── _headers            CSP and friends, for Cloudflare Pages
-├── serve.py            a local server that sends those same headers
+├── serve.py            a local server that sends those same headers, and
+│                       (with --itksnap) the Open-in-ITK-SNAP launch helper
 ├── vendor/             onnxruntime-web, self-hosted (no CDN)
 ├── model/              the trained weights — NOT in this repo, see "The model"
 └── lib/
