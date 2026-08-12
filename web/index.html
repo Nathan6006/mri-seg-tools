@@ -323,7 +323,7 @@
 
     <div id="drop">
       <div class="big">Drag scan folders here</div>
-      <div class="meta">
+      <div class="meta" id="dropHint">
         Select as many as you like in Finder and drag them in together —
         this is the only way to add several at once.
       </div>
@@ -332,7 +332,7 @@
         <button id="btnPick" class="primary">Choose one folder…</button>
         <button id="btnPickMore" style="display:none">Add another…</button>
       </div>
-      <div class="meta" style="margin-top:14px;max-width:52ch;margin-inline:auto">
+      <div class="meta" id="pickHint" style="margin-top:14px;max-width:52ch;margin-inline:auto">
         The file dialog can only take <strong>one folder at a time</strong> —
         that is a browser restriction, not a setting. Click it repeatedly to
         queue more, or pick a parent folder to get every scan inside it.

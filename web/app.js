@@ -150,6 +150,27 @@ $('#picker').onchange = e => {
 };
 $('#btnClear').onclick = () => { STAGED.clear(); renderStaged(); };
 
+/* In the desktop shell the native dialog can select several folders at once,
+   which removes the one-folder-at-a-time browser restriction the hint below
+   the button explains. lib/desktop.js shapes what it returns exactly like the
+   picker's entries, so the whole pipeline downstream is unchanged; the bytes
+   are simply read through the shell when asked for. */
+if(window.desktopBridge){
+  $('#btnPick').textContent = 'Choose scan folders…';
+  $('#pickHint').textContent = 'Several folders can be selected at once, '
+    + 'or pick a parent folder to get every scan inside it.';
+  $('#dropHint').textContent = 'Select as many as you like in Finder and '
+    + 'drag them in together.';
+  $('#btnPick').onclick = $('#btnPickMore').onclick = async () => {
+    try{
+      const picks = await window.desktopBridge.pickScanFolders();
+      if(!picks.length) return;
+      const { entriesFromPicks } = await import('./lib/desktop.js');
+      addFiles(entriesFromPicks(picks, window.desktopBridge));
+    }catch(e){ toast(e.message, true); }
+  };
+}
+
 /* drag and drop, including whole directory trees */
 const drop = $('#drop');
 ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e=>{
@@ -1721,20 +1742,27 @@ function renderDetail(){
     try{
       if(FOLDER.linked){
         const j = await Backend.exportToFolder([SEL]);
-        // With the serve.py helper running, go one step further and open it.
+        // With a launcher available -- the desktop shell itself, or the local
+        // helper server -- go one step further and open it.
         if(HELPER.available){
-          const r = await fetch('itksnap/open', {method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({case: SEL})});
-          const jj = await r.json().catch(() => ({}));
-          if(r.ok){
+          let jj;
+          if(window.desktopBridge){
+            jj = await window.desktopBridge.itksnapOpen(SEL).catch(e => ({error: e.message}));
+          }else{
+            const r = await fetch('itksnap/open', {method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({case: SEL})});
+            jj = await r.json().catch(() => ({}));
+            if(!r.ok && !jj.error) jj.error = `The helper could not open it (HTTP ${r.status})`;
+          }
+          if(!jj.error){
             $('#itkMsg').innerHTML =
               `<div class="meta">Opened in ITK-SNAP. Correct the mask, save it `
               + `(<kbd>⌘S</kbd>), then press <strong>Check folder for edits</strong>.</div>`;
             toast('Opened in ITK-SNAP');
             return;
           }
-          toast(jj.error || `The helper could not open it (HTTP ${r.status})`, true);
+          toast(jj.error, true);
           // Fall through to the written-to-folder message: the files are there.
         }
         $('#itkMsg').innerHTML =
@@ -2021,6 +2049,13 @@ let FOLDER = {supported:false, linked:false, name:null};
 let HELPER = {available:false, dir:null};
 
 async function probeHelper(){
+  // The desktop shell can always launch ITK-SNAP itself -- the probe there is
+  // simply whether the binary is installed on this machine.
+  if(window.desktopBridge){
+    try{ HELPER = {available: await window.desktopBridge.itksnapAvailable(), dir:null}; }
+    catch{ HELPER = {available:false, dir:null}; }
+    return;
+  }
   try{
     const r = await fetch('itksnap/status', {cache:'no-store'});
     const j = r.ok ? await r.json() : null;

@@ -1,0 +1,19 @@
+{
+  "name": "mri-review-desktop",
+  "productName": "MRI Review",
+  "version": "0.1.0",
+  "description": "Desktop shell for the in-browser MRI segmentation review tool",
+  "main": "main.js",
+  "type": "commonjs",
+  "license": "MIT",
+  "scripts": {
+    "start": "env -u ELECTRON_RUN_AS_NODE electron .",
+    "smoke": "env -u ELECTRON_RUN_AS_NODE electron . --smoke",
+    "selftest": "env -u ELECTRON_RUN_AS_NODE electron . --selftest",
+    "dist": "env -u ELECTRON_RUN_AS_NODE electron-builder --mac --config electron-builder.json"
+  },
+  "devDependencies": {
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3"
+  }
+}

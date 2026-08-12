@@ -39,7 +39,19 @@ import * as store from './store.js';
 
 const HANDLE_KEY = 'itksnapFolder';
 
+/**
+ * The desktop shell provides the same capability without the ceremony: the
+ * linked folder is a plain path its main process remembers, permission is a
+ * property of the process rather than a per-session grant, and all reads and
+ * writes happen on the other side of a validated IPC bridge. Every function
+ * here branches on the bridge first, so the rest of the app cannot tell which
+ * build it is running in -- which is the point.
+ */
+const bridge = () =>
+  (typeof window !== 'undefined' && window.desktopBridge) || null;
+
 export function isSupported() {
+  if (bridge()) return true;
   return typeof window !== 'undefined' && 'showDirectoryPicker' in window;
 }
 
@@ -50,6 +62,14 @@ export function isSupported() {
  * rejection looks identical to the user clicking Cancel.
  */
 export async function pickFolder() {
+  if (bridge()) {
+    const j = await bridge().pickExportFolder();
+    // Closing the native dialog is the user changing their mind, and the
+    // browser picker signals exactly that with an AbortError. Match it, so
+    // the caller's "cancel is not a failure" handling covers both builds.
+    if (!j) throw new DOMException('The folder picker was closed', 'AbortError');
+    return { name: j.name, desktop: true };
+  }
   if (!isSupported()) {
     throw new Error(
       'This browser cannot share a folder with ITK-SNAP -- showDirectoryPicker ' +
@@ -64,10 +84,15 @@ export async function pickFolder() {
 }
 
 export async function storedFolder() {
+  if (bridge()) {
+    const s = await bridge().folderStatus();
+    return s.linked ? { name: s.name, desktop: true } : null;
+  }
   return store.getKV(HANDLE_KEY, null);
 }
 
 export async function forgetFolder() {
+  if (bridge()) return bridge().forgetExportFolder();
   await store.setKV(HANDLE_KEY, null);
 }
 
@@ -82,6 +107,7 @@ export async function forgetFolder() {
 export async function activeFolder(interactive = false) {
   const handle = await storedFolder();
   if (!handle) return null;
+  if (handle.desktop) return handle;   // the shell's folder never needs re-granting
   const opts = { mode: 'readwrite' };
   let state = await handle.queryPermission(opts);
   if (state === 'prompt' && interactive) state = await handle.requestPermission(opts);
@@ -91,7 +117,7 @@ export async function activeFolder(interactive = false) {
 /** Does the remembered folder need a click to re-grant access? */
 export async function needsPermission() {
   const handle = await storedFolder();
-  if (!handle) return false;
+  if (!handle || handle.desktop) return false;
   return (await handle.queryPermission({ mode: 'readwrite' })) !== 'granted';
 }
 
@@ -109,6 +135,17 @@ const toBytes = async (v) =>
  * reason: nobody should lose an afternoon of tracing to a stray click.
  */
 export async function writeCase(folder, record, files, { overwriteMask = false } = {}) {
+  if (folder?.desktop) {
+    // The never-clobber rule travels with the request; the shell's main
+    // process does the existence check where the files actually are.
+    const payload = [];
+    for (const [kind, name] of Object.entries(record.files)) {
+      const bytes = await toBytes(files[kind]);
+      if (bytes == null) continue;
+      payload.push({ name, bytes, skipIfExists: kind === 'mask' && !overwriteMask });
+    }
+    return bridge().writeCase(record.case, payload);
+  }
   const dir = await folder.getDirectoryHandle(record.case, { create: true });
   const written = [];
 
@@ -127,6 +164,7 @@ export async function writeCase(folder, record, files, { overwriteMask = false }
 
 /** The ITK-SNAP label description, written once at the top of the folder. */
 export async function writeLabelFile(folder, contents) {
+  if (folder?.desktop) return bridge().writeExportFile('Tumor_label.txt', contents);
   const fh = await folder.getFileHandle('Tumor_label.txt', { create: true });
   const w = await fh.createWritable();
   await w.write(new TextEncoder().encode(contents));
@@ -145,6 +183,17 @@ async function exists(dir, name) {
  * to answer that, and duplicating the rule here is how the two would drift.
  */
 export async function readMasks(folder, records) {
+  if (folder?.desktop) {
+    const found = await bridge().readCaseMasks(
+      records.map((r) => ({ case: r.case, mask: r.files.mask })));
+    // Bytes arrive from the bridge as a structured clone; make the type the
+    // callers were promised rather than trusting what IPC hands back.
+    return found.map((f) => ({
+      case: f.case,
+      bytes: f.bytes instanceof Uint8Array ? f.bytes : new Uint8Array(f.bytes),
+      lastModified: f.lastModified,
+    }));
+  }
   const found = [];
   for (const r of records) {
     try {

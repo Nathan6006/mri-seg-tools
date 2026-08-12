@@ -33,6 +33,12 @@ and the Content-Security-Policy — the thing that proves the page cannot phone
 home — never gets exercised until production. `serve.py` sends both, so testing
 locally means something.
 
+There is also a **desktop build** — an Electron shell around this same folder
+that adds native multi-folder ingest, a permission-free ITK-SNAP round trip,
+one-click launch, and durable storage. See [`../desktop/README.md`](../desktop/README.md).
+The web code feature-detects the shell (`window.desktopBridge`) the same way
+it feature-detects `showDirectoryPicker`; nothing here depends on it.
+
 ## Deploying it
 
 **Cloudflare Pages**, from this repo:
