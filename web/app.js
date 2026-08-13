@@ -31,9 +31,19 @@ let FILTER='all', SORT='priority', QUERY='';
    that gets stored -- these are display and workflow settings only. */
 const PREFS = Object.assign({
   opacity:55, radius:6, autoNext:false, threeUp:true, crosshair:true,
-  square:false, brush3d:false, adaptTol:8, freehandAuto:true,
+  brushShape:'round', brush3d:false, adaptTol:8, freehandAuto:true,
 }, JSON.parse(localStorage.getItem('mriseg.prefs') || '{}'));
 const savePrefs = () => localStorage.setItem('mriseg.prefs', JSON.stringify(PREFS));
+
+/* Older builds stored the brush shape as a boolean and kept "adaptive" as a
+   separate tool; the ITK-SNAP-style UI folds it into the brush as its third
+   shape, the way ITK-SNAP's own paintbrush panel does. Map stored prefs
+   forward once (idempotent), so nobody reloads into a tool that no longer
+   exists. */
+if(PREFS.square !== undefined && !JSON.parse(localStorage.getItem('mriseg.prefs')||'{}').brushShape)
+  PREFS.brushShape = PREFS.square ? 'square' : 'round';
+if(PREFS.tool === 'adaptive'){ PREFS.tool = 'brush'; PREFS.brushShape = 'adaptive'; }
+delete PREFS.square;
 
 // There is no server to lose contact with any more, so the old offline banner
 // is now the storage banner: the one comparable way this build can quietly
@@ -663,13 +673,13 @@ function bindPointerReadout(){
           Math.round(realVal(VOL.img[vIndex(vx,vy,SLICE)]))}`;
     }
     if(dot){
-      const brushy = ED.on && ['brush','eraser','adaptive'].includes(ED.tool);
+      const brushy = ED.on && isBrushy(ED.tool);
       if(brushy && inside){
         // Brush radius is in voxels; scale it to however big a voxel is on
         // screen right now, so the circle stays truthful at any zoom.
         const px = (r.width / VOL.nx) * ED.radius;
         dot.style.display = 'block';
-        dot.style.borderRadius = ED.square ? '2px' : '50%';
+        dot.style.borderRadius = ED.shape === 'square' ? '2px' : '50%';
         dot.style.width = dot.style.height = (px*2)+'px';
         const b = box.getBoundingClientRect();
         dot.style.left = (e.clientX - b.left - px)+'px';
@@ -797,13 +807,21 @@ const ED = {
   dirty:new Set(),     // slices changed since the last save
   undo:[], redo:[],
   tool:'freehand', radius:6, painting:false, last:null,
-  square:false, brush3d:false, adaptTol:8,
+  shape:'round',           // brush shape: round | square | adaptive
+  brush3d:false, adaptTol:8,
   subtract:false,          // whether the outline tools add or take away
   poly:[], polyDrag:-1, polyFresh:false, lastPoly:null, tracing:false,
   ruler:null,              // the ruler being dragged out right now
 };
 
 const countOn = m => { let n=0; for(let i=0;i<m.length;i++) if(m[i]) n++; return n; };
+
+// The brush-like tools: the ones the brush panel (shape, 3D, size) applies to,
+// and the ones a right-button drag paints in reverse with.
+const isBrushy = t => t === 'brush' || t === 'eraser';
+// The adaptive region-grow runs when the brush's SHAPE is adaptive -- it is a
+// shape in ITK-SNAP's paintbrush panel, not a separate tool.
+const adaptiveOn = () => isBrushy(ED.tool) && ED.shape === 'adaptive';
 
 // The mask for one slice, as a view onto the volume rather than a copy -- so a
 // stroke written here is immediately visible in the coronal and sagittal panes
@@ -973,7 +991,7 @@ function edStamp(cx, cy, erase){
       const dy = y-cy;
       for(let x=Math.max(0,Math.ceil(cx-rr)); x<=Math.min(nx-1,Math.floor(cx+rr)); x++){
         const dx = x-cx;
-        if(!ED.square && dx*dx+dy*dy > rr2) continue;
+        if(ED.shape !== 'square' && dx*dx+dy*dy > rr2) continue;
         VOL.mask[off+y*nx+x] = erase ? 0 : 1;
       }
     }
@@ -1008,7 +1026,7 @@ function edAdaptive(cx, cy, erase){
     if(x<0 || y<0 || x>=nx || y>=ny) continue;
     const dx = x-cx, dy = y-cy;
     if(Math.abs(dx) > r || Math.abs(dy) > r) continue;
-    if(!ED.square && dx*dx+dy*dy > r2) continue;
+    if(dx*dx+dy*dy > r2) continue;    // the adaptive footprint is always round
     const s = (dy+r)*side + (dx+r);
     if(seen[s]) continue;
     seen[s] = 1;
@@ -1106,7 +1124,7 @@ async function edEnter(){
   ED.poly = []; ED.polyDrag = -1;
   ED.tool = PREFS.tool || 'freehand';
   ED.radius = PREFS.radius;
-  ED.square = !!PREFS.square;
+  ED.shape = PREFS.brushShape || 'round';
   ED.brush3d = !!PREFS.brush3d;
   ED.adaptTol = PREFS.adaptTol;
   await loadVolume(SEL);
@@ -1231,9 +1249,9 @@ function bindPane(plane){
     // Holding Alt inverts the tool. Far quicker than going to the toolbar and
     // back for a two-voxel fix, which is most of what correction actually is.
     const erase = ED.tool === 'scalpel' ? true : (ED.tool==='eraser') !== e.altKey;
-    if(ED.tool === 'scalpel')      edCut(p[0], p[1], p[0], p[1]);
-    else if(ED.tool === 'adaptive') edAdaptive(p[0], p[1], erase);
-    else                            edStamp(p[0], p[1], erase);
+    if(ED.tool === 'scalpel')  edCut(p[0], p[1], p[0], p[1]);
+    else if(adaptiveOn())      edAdaptive(p[0], p[1], erase);
+    else                       edStamp(p[0], p[1], erase);
     ED.dirty.add(SLICE); edRepaint();
   });
 
@@ -1262,8 +1280,8 @@ function bindPane(plane){
       polyDraw();
       return;
     }
-    if(ED.tool === 'scalpel')       edCut(ED.last[0], ED.last[1], p[0], p[1]);
-    else if(ED.tool === 'adaptive') edAdaptive(p[0], p[1], (ED.tool==='eraser') !== e.altKey);
+    if(ED.tool === 'scalpel') edCut(ED.last[0], ED.last[1], p[0], p[1]);
+    else if(adaptiveOn())     edAdaptive(p[0], p[1], (ED.tool==='eraser') !== e.altKey);
     else edStroke(ED.last[0], ED.last[1], p[0], p[1],
                   (ED.tool==='eraser') !== e.altKey);
     ED.last = p; edRepaint();
@@ -1342,15 +1360,18 @@ function bindEditorToolbar(){
   on('#tFree',  pick('freehand'));
   on('#tPoly',  pick('polygon'));
   on('#tBrush', pick('brush'));
-  on('#tAdapt', pick('adaptive'));
   on('#tErase', pick('eraser'));
   on('#tFill',  pick('fill'));
   on('#tCut',   pick('scalpel'));
   on('#tRuler', pick('ruler'));
   on('#tCross', pick('cross'));
   on('#tMode',  () => { ED.subtract = !ED.subtract; renderDetail(); });
-  on('#tShape', () => { ED.square = !ED.square; PREFS.square = ED.square;
-                        savePrefs(); renderDetail(); });
+  document.querySelectorAll('#tShapeSeg button').forEach(btn => {
+    btn.onclick = () => {
+      ED.shape = btn.dataset.shape; PREFS.brushShape = ED.shape;
+      savePrefs(); renderDetail();
+    };
+  });
   on('#t3d',    () => { ED.brush3d = !ED.brush3d; PREFS.brush3d = ED.brush3d;
                         savePrefs(); renderDetail(); });
   on('#tInterp', edInterpolate);
@@ -1435,13 +1456,12 @@ function paneHTML(plane, id, innerId, extra){
 function toolbarHTML(){
   const b = (id, key, label, tool, title) =>
     `<button id="${id}" class="${ED.tool===tool?'on':''}" title="${title}">${label}</button>`;
-  const brushy = ['brush','eraser','adaptive'].includes(ED.tool);
+  const brushy = isBrushy(ED.tool);
   return `
     <div id="edBar">
       ${b('tFree','F','✎ Freehand','freehand','F — trace round the boundary and let go')}
       ${b('tPoly','P','◇ Polygon','polygon','P — click points, adjust them, then Accept')}
-      ${b('tBrush','B','● Brush','brush','B — paint voxels')}
-      ${b('tAdapt','A','◐ Adaptive','adaptive','A — paint only what matches the intensity under the cursor')}
+      ${b('tBrush','B','● Brush','brush','B — paint voxels; right-drag erases')}
       ${b('tErase','E','⌫ Erase','eraser','E')}
       ${b('tFill','G','◉ Fill','fill','G — fill an enclosed area, or remove a whole blob')}
       ${b('tCut','X','✂ Cut','scalpel','X — draw a line to cut the mask in two')}
@@ -1452,13 +1472,22 @@ function toolbarHTML(){
         >${ED.subtract ? '− subtract' : '+ add'}</button>
       ${brushy ? `
       <span class="sep"></span>
-      <button id="tShape" title="Round or square brush">${ED.square?'▪ square':'● round'}</button>
-      <button id="t3d" class="${ED.brush3d?'on':''}"
-        title="Paint a ball through neighbouring slices instead of a disc on this one">3D</button>
+      <span id="tShapeSeg">
+        <button data-shape="round" class="${ED.shape==='round'?'on':''}"
+          title="Round brush">●</button
+        ><button data-shape="square" class="${ED.shape==='square'?'on':''}"
+          title="Square brush">▪</button
+        ><button data-shape="adaptive" class="${ED.shape==='adaptive'?'on':''}"
+          title="Adaptive brush — paints only what is contiguous with, and close in intensity to, the voxel under the cursor. ITK-SNAP's third brush shape.">◐</button>
+      </span>
+      ${ED.shape==='adaptive' ? `<button id="t3d" disabled
+        title="The adaptive brush works on one slice at a time">3D</button>`
+      : `<button id="t3d" class="${ED.brush3d?'on':''}"
+        title="Paint a ball through neighbouring slices instead of a disc on this one">3D</button>`}
       <label>size</label>
       <input type="range" id="tSize" min="1" max="40" value="${ED.radius}">
       <span id="edSize" class="ednum">${brushLabel()}</span>` : ''}
-      ${ED.tool==='adaptive' ? `
+      ${brushy && ED.shape==='adaptive' ? `
       <label>tolerance</label>
       <input type="range" id="tTol" min="1" max="60" value="${ED.adaptTol}">
       <span id="edTol" class="ednum">${ED.adaptTol}%</span>` : ''}
@@ -2209,7 +2238,7 @@ document.addEventListener('keydown', e => {
         e.preventDefault(); polyReset(); toast('Outline discarded'); return; }
       if(k==='v'){ polyPaste(); return; }
     }
-    const tk = {f:'freehand', p:'polygon', b:'brush', a:'adaptive', e:'eraser',
+    const tk = {f:'freehand', p:'polygon', b:'brush', e:'eraser',
                 g:'fill', x:'scalpel', r:'ruler', c:'cross'}[k];
     if(tk){ ED.tool=tk; if(tk!=='polygon' && tk!=='freehand') polyReset();
             PREFS.tool=tk; savePrefs(); renderDetail(); return; }
