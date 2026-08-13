@@ -416,46 +416,68 @@
 <div id="help"><div class="sheet">
   <div class="row"><h3 style="flex:1">Keyboard shortcuts</h3>
     <button id="helpClose">Close</button></div>
+  <p class="meta" style="margin:0 0 10px">The keys follow ITK-SNAP's, so habits
+    carry over. The worklist is the one addition ITK-SNAP does not have: arrow
+    keys switch scan and slice there, and reviewing is <kbd>Y</kbd>/<kbd>N</kbd>.</p>
+  <h4>Tools — ITK-SNAP's numbers</h4>
+  <dl>
+    <dt><kbd>1</kbd></dt><dd>crosshair — click moves the cursor; right-drag zooms, middle-drag pans</dd>
+    <dt><kbd>2</kbd></dt><dd>zoom/pan — left-drag pans, right-drag zooms</dd>
+    <dt><kbd>3</kbd> / <kbd>P</kbd></dt><dd>polygon — opens the editor if needed</dd>
+    <dt><kbd>4</kbd> / <kbd>B</kbd></dt><dd>paintbrush — opens the editor if needed</dd>
+    <dt><kbd>5</kbd></dt><dd>the snake's job is done by the model here</dd>
+    <dt><kbd>6</kbd> / <kbd>R</kbd></dt><dd>ruler — drag to measure in mm, works while reviewing too</dd>
+  </dl>
+  <h4>Segmentation display</h4>
+  <dl>
+    <dt><kbd>S</kbd></dt><dd>hide / reveal the mask</dd>
+    <dt><kbd>A</kbd> / <kbd>D</kbd></dt><dd>more transparent / more opaque</dd>
+    <dt><kbd>X</kbd></dt><dd>show or hide annotations (rulers)</dd>
+    <dt><kbd>⇧X</kbd> or <kbd>H</kbd></dt><dd>show or hide the crosshair</dd>
+    <dt><kbd>⌘J</kbd></dt><dd>set the contrast from the image automatically</dd>
+  </dl>
   <h4>Moving around</h4>
   <dl>
-    <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>previous / next scan</dd>
-    <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>previous / next slice</dd>
+    <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>previous / next scan (worklist only)</dd>
+    <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>previous / next slice — <strong>in the
+      editor</strong> the arrows move the cursor by a voxel, 5 with <kbd>⇧</kbd></dd>
+    <dt><kbd>PgUp</kbd> <kbd>PgDn</kbd></dt><dd>previous / next slice, everywhere</dd>
     <dt>scroll</dt><dd>move through slices — or through the reformat you are over</dd>
     <dt>click a pane</dt><dd>move the crosshair; the other panes follow</dd>
+    <dt><kbd>C</kbd></dt><dd>centre the views on the cursor</dd>
     <dt><kbd>T</kbd></dt><dd>show or hide the coronal and sagittal panes</dd>
-    <dt><kbd>H</kbd></dt><dd>show or hide the crosshair</dd>
-    <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>zoom in, out, reset</dd>
+    <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd> <kbd>⌘F</kbd></dt><dd>zoom in, out, reset, fit</dd>
     <dt>⌘ / ctrl + scroll</dt><dd>zoom around the pointer</dd>
     <dt><kbd>space</kbd> + drag</dt><dd>pan</dd>
   </dl>
   <h4>Reviewing</h4>
   <dl>
-    <dt><kbd>A</kbd></dt><dd>mark the mask as correct</dd>
-    <dt><kbd>F</kbd></dt><dd>flag it for follow-up</dd>
+    <dt><kbd>Y</kbd></dt><dd>mark the mask as correct</dd>
+    <dt><kbd>N</kbd></dt><dd>flag it for follow-up</dd>
   </dl>
   <h4>Editing — tools</h4>
   <dl>
-    <dt><kbd>F</kbd></dt><dd>freehand — trace round the boundary and let go</dd>
-    <dt><kbd>P</kbd></dt><dd>polygon — click points, adjust them, then Accept</dd>
-    <dt><kbd>B</kbd> / <kbd>E</kbd></dt><dd>brush / eraser</dd>
-    <dt><kbd>A</kbd></dt><dd>adaptive brush — paints only what matches under the cursor</dd>
+    <dt><kbd>E</kbd></dt><dd>eraser</dd>
     <dt><kbd>G</kbd></dt><dd>fill an enclosed gap, or remove a whole blob</dd>
-    <dt><kbd>X</kbd></dt><dd>cut — slice the mask in two along a line</dd>
-    <dt><kbd>R</kbd></dt><dd>ruler — drag to measure in mm</dd>
-    <dt><kbd>C</kbd></dt><dd>navigate — move the crosshair without painting</dd>
+    <dt><kbd>K</kbd></dt><dd>cut — slice the mask in two along a line</dd>
     <dt><kbd>M</kbd></dt><dd>switch between adding and subtracting</dd>
-    <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>smaller / larger brush</dd>
-    <dt><kbd>alt</kbd> + drag</dt><dd>temporarily invert brush and eraser</dd>
+    <dt><kbd>[</kbd> <kbd>]</kbd> or <kbd>+</kbd> <kbd>−</kbd></dt><dd>smaller / larger brush</dd>
+    <dt>right-drag</dt><dd>erase with the brush (paint, with the eraser)</dd>
+    <dt><kbd>alt</kbd> + drag</dt><dd>same, held on the keyboard</dd>
+    <dt>brush shapes</dt><dd>round, square, or adaptive — adaptive paints only
+      what matches the intensity under the cursor</dd>
   </dl>
-  <h4>Editing — outlines</h4>
+  <h4>Editing — the polygon</h4>
   <dl>
-    <dt>press and drag</dt><dd>trace freehand; it fills when you let go</dd>
-    <dt>click</dt><dd>add a polygon point; drag one to move it</dd>
+    <dt>click</dt><dd>add a point</dd>
+    <dt>press and drag</dt><dd>trace a curve — mix clicks and curves freely</dd>
+    <dt>click the first point or <kbd>⏎</kbd></dt><dd>close the outline</dd>
+    <dt>then: drag a point</dt><dd>move it</dd>
     <dt>shift-click a point</dt><dd>delete it</dd>
     <dt>click an edge</dt><dd>insert a point there</dd>
-    <dt><kbd>⏎</kbd></dt><dd>accept and fill the outline</dd>
+    <dt><kbd>⏎</kbd> again</dt><dd>accept and fill</dd>
     <dt><kbd>V</kbd></dt><dd>paste the last accepted outline onto this slice</dd>
-    <dt><kbd>⌫</kbd></dt><dd>remove the last point</dd>
+    <dt><kbd>⌫</kbd></dt><dd>remove the last point (while drawing)</dd>
     <dt><kbd>esc</kbd></dt><dd>discard the outline</dd>
   </dl>
   <h4>Editing — the rest</h4>

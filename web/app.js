@@ -1643,7 +1643,7 @@ function toolbarHTML(){
       ${b('tBrush','B','● Brush','brush','B — paint voxels; right-drag erases')}
       ${b('tErase','E','⌫ Erase','eraser','E')}
       ${b('tFill','G','◉ Fill','fill','G — fill an enclosed area, or remove a whole blob')}
-      ${b('tCut','X','✂ Cut','scalpel','X — draw a line to cut the mask in two')}
+      ${b('tCut','K','✂ Cut','scalpel','K — draw a line to cut the mask in two')}
       ${b('tRuler','R','↔ Ruler','ruler','R or 6 — drag to measure a distance in mm')}
       ${b('tCross','C','✛ Navigate','cross','1 — move the crosshair without painting; right-drag zooms, middle-drag pans')}
       ${b('tZoom','Z','⤢ Zoom/pan','zoom','2 — left-drag pans, right-drag zooms')}
@@ -1725,11 +1725,11 @@ function renderDetail(){
         series ${c.series} · ${c.size_xyz.join('×')}</span>
       <span class="spacer"></span>
       <span class="meta">${ED.on
-        ? `<kbd>F</kbd> freehand · <kbd>B</kbd> brush · <kbd>[</kbd><kbd>]</kbd> size ·
-           <kbd>⌘Z</kbd> undo · <kbd>⌘S</kbd> save · <kbd>alt</kbd> invert`
+        ? `<kbd>3</kbd> polygon · <kbd>4</kbd> brush · <kbd>[</kbd><kbd>]</kbd> size ·
+           <kbd>⌘Z</kbd> undo · <kbd>⌘S</kbd> save · right-drag erase`
         : `<kbd>↑</kbd><kbd>↓</kbd> scans · <kbd>←</kbd><kbd>→</kbd> slices ·
-           <kbd>A</kbd> accept · <kbd>F</kbd> flag`}
-        · <kbd>+</kbd><kbd>−</kbd><kbd>0</kbd> zoom · <kbd>space</kbd> pan</span>
+           <kbd>Y</kbd> correct · <kbd>N</kbd> flag`}
+        · <kbd>S</kbd> mask · <kbd>A</kbd><kbd>D</kbd> opacity · <kbd>0</kbd> zoom</span>
     </div>
     <div class="viewer">
       <div>
@@ -1762,7 +1762,7 @@ function renderDetail(){
             ED.on ? 'Stop editing' : 'Edit mask here'}</button>
           <button id="btnThree" class="${PREFS.threeUp?'primary':''}"
             title="Show the coronal and sagittal reformats (T)">Three planes</button>
-          <button id="btnCross" title="Show or hide the linked crosshair (H)"
+          <button id="btnCross" title="Show or hide the linked crosshair (⇧X or H)"
             >${PREFS.crosshair===false?'Show':'Hide'} crosshair</button>
           <span class="spacer"></span>
           <span class="meta">scroll to change slice · click any pane to move the crosshair</span>

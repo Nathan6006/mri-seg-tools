@@ -56,8 +56,20 @@ const argAfter = (flag, n = 1) => {
 };
 const E2E = argAfter('--e2e', 2);          // [scanDir, exportDir] or null
 const E2E_VERIFY = process.argv.includes('--e2e-verify');
+// `--migration` seeds localStorage with a pre-2026-08-13 prefs blob (separate
+// freehand/adaptive tools, boolean brush shape), reloads, and checks the app
+// maps it forward instead of booting into tools that no longer exist.
+const MIGRATION = process.argv.includes('--migration');
 const PROFILE = argAfter('--profile')?.[0];
-if (PROFILE) app.setPath('userData', PROFILE);
+if (PROFILE) {
+  app.setPath('userData', PROFILE);
+} else if (SMOKE || SELFTEST || E2E || E2E_VERIFY || process.argv.includes('--migration')) {
+  // Test modes must NEVER run on the real profile. The selftest creates and
+  // then clears workspace data -- against the user's own storage that would
+  // delete their results (it did once; this guard is why it cannot again).
+  // Anything that needs persistent state across launches passes --profile.
+  app.setPath('userData', path.join(app.getPath('temp'), `mri-review-test-${Date.now()}`));
+}
 
 // Where the tool's files live: next door in development, packed into the app
 // bundle's resources once built. Same layout either way.
@@ -397,7 +409,7 @@ function createWindow() {
   const win = new BrowserWindow({
     width: 1440,
     height: 940,
-    show: !SMOKE && !SELFTEST && !E2E && !E2E_VERIFY,
+    show: !SMOKE && !SELFTEST && !E2E && !E2E_VERIFY && !MIGRATION,
     backgroundColor: '#111418',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -670,6 +682,28 @@ const UI_KEYS_SCRIPT = `(async () => {
   return out;
 })()`;
 
+/* ======================= prefs-migration test ======================= */
+
+async function runMigration(win) {
+  await win.webContents.executeJavaScript(`localStorage.setItem('mriseg.prefs',
+    JSON.stringify({tool:'freehand', square:true, freehandAuto:false, radius:9}))`, true);
+  win.webContents.reload();
+  await new Promise((res) => win.webContents.once('did-finish-load', res));
+  const r = await win.webContents.executeJavaScript(`(async () => {
+    // Force a savePrefs so the migrated state lands back in storage.
+    const cb = document.querySelector('#autoNext');
+    cb.click(); cb.click();
+    const p = JSON.parse(localStorage.getItem('mriseg.prefs'));
+    return { tool: p.tool, brushShape: p.brushShape, radius: p.radius,
+             square: p.square, freehandAuto: p.freehandAuto };
+  })()`, true);
+  console.log('[migration]', JSON.stringify(r));
+  const ok = r.tool === 'polygon' && r.brushShape === 'square' && r.radius === 9
+          && r.square === undefined && r.freehandAuto === undefined;
+  console.log(ok ? '[migration] PASS' : '[migration] FAIL');
+  app.exit(ok ? 0 : 1);
+}
+
 /* ======================= lifecycle ======================= */
 
 // The About box names the model weights this copy carries. Two runs with
@@ -709,6 +743,10 @@ app.whenReady().then(() => {
   } else if (E2E || E2E_VERIFY) {
     win.webContents.once('did-finish-load', () => {
       runE2E(win).catch((e) => { console.error('[e2e] error', e); app.exit(2); });
+    });
+  } else if (MIGRATION) {
+    win.webContents.once('did-finish-load', () => {
+      runMigration(win).catch((e) => { console.error('[migration] error', e); app.exit(2); });
     });
   }
 

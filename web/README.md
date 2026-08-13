@@ -110,6 +110,16 @@ editing tools, window/level, zoom, review priorities, correction tracking, the
 keyboard shortcuts. That is the point of the port — the front end never
 depended on there being a server, only on being handed a volume and a mask.
 
+**The interaction model follows ITK-SNAP's** (added 2026-08-13), taken from its
+own source rather than memory: tools on `1`–`6`, `S` to hide the segmentation,
+`A`/`D` for its opacity, `X`/`⇧X` for annotations and crosshair, `C` to centre
+on the cursor, right-drag zoom, right-click erase on the brush, the
+round/square/adaptive brush shapes, and the polygon's draw → close → edit →
+accept flow with freehand tracing folded in. The `?` overlay in the app is the
+full, current list. The worklist is the one deliberate departure — ITK-SNAP
+has no review concept — so arrow keys there still switch scan and slice, and
+review verdicts sit on `Y`/`N`.
+
 Two things genuinely cannot be carried over:
 
 * **Launching ITK-SNAP.** A web page cannot start a program — that is the
