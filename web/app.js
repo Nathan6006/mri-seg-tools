@@ -712,6 +712,27 @@ how maps and image viewers behave.
 const ZOOM = {scale:1, x:0, y:0, panning:false, from:null};
 const MAX_ZOOM = 12;
 
+// A right-button drag zooms, ITK-SNAP style: up zooms in, down out, anchored
+// where the drag started.
+const RZOOM = {on:false, y0:0, scale0:1, ax:0, ay:0};
+
+// The tool that governs the mouse right now. The navigation tools work
+// modeless -- outside the editor they keep working, and anything that would
+// write to the mask falls back to plain crosshair behaviour.
+const NAV_TOOLS = ['cross','zoom','ruler'];
+const activeTool = () =>
+  ED.on ? ED.tool : (NAV_TOOLS.includes(ED.tool) ? ED.tool : 'cross');
+
+// A drag that pans or zooms must also cancel any pending click-to-move-the-
+// crosshair on the panes -- the box captures the pointer, so the pane never
+// sees the pointerup and a stale click could teleport the crosshair later.
+function cancelPaneClicks(){
+  for(const P of Object.values(PLANES)){
+    const cv = $('#'+P.ids+'Ovr');
+    if(cv) cv._click = null;
+  }
+}
+
 // Zoom applies to the axial pane only. The coronal and sagittal reformats are
 // small orientation views; zooming them independently would be three sets of
 // pan state to keep straight for no gain.
@@ -770,25 +791,48 @@ function zoomBind(){
   if($('#zOut'))   $('#zOut').onclick   = () => zoomStep(1/1.25);
   if($('#zReset')) $('#zReset').onclick = zoomReset;
 
-  // Middle-drag, or any drag while zoomed in view mode, pans. In edit mode a
-  // plain drag has to stay reserved for painting, so panning needs the middle
-  // button or the space bar.
+  // Right-click is a tool here (zoom, or reverse-paint), never a menu.
+  box.addEventListener('contextmenu', e => e.preventDefault());
+
+  // Mouse buttons follow ITK-SNAP. Crosshair mode: left moves the cursor
+  // (the pane's job), right-drag zooms, middle-drag pans -- with ctrl+left
+  // and alt+left standing in for right and middle. Zoom/pan mode: left pans,
+  // right zooms. In the editor a plain drag stays reserved for painting, and
+  // a right-drag on a brush-like tool erases instead of zooming.
   box.addEventListener('pointerdown', e => {
-    const wantPan = e.button === 1 || SPACE_DOWN ||
-                    (!ED.on && ZOOM.scale > 1 && e.button === 0);
-    if(!wantPan) return;
+    const tool = activeTool();
+    const wantZoom = (e.button === 2 && !(ED.on && isBrushy(tool)))
+                  || (e.button === 0 && e.ctrlKey && tool === 'cross');
+    const wantPan  = e.button === 1 || SPACE_DOWN
+                  || (e.button === 0 && tool === 'zoom')
+                  || (e.button === 0 && e.altKey && tool === 'cross')
+                  || (!ED.on && ZOOM.scale > 1 && e.button === 0 && tool === 'cross');
+    if(!wantZoom && !wantPan) return;
     e.preventDefault();
-    ZOOM.panning = true; ZOOM.from = [e.clientX, e.clientY, ZOOM.x, ZOOM.y];
+    cancelPaneClicks();
     box.classList.add('panning');
     box.setPointerCapture(e.pointerId);
+    if(wantZoom){
+      Object.assign(RZOOM, {on:true, y0:e.clientY, scale0:ZOOM.scale,
+                            ax:e.clientX, ay:e.clientY});
+      return;
+    }
+    ZOOM.panning = true; ZOOM.from = [e.clientX, e.clientY, ZOOM.x, ZOOM.y];
   });
   box.addEventListener('pointermove', e => {
+    if(RZOOM.on){
+      const target = RZOOM.scale0 * Math.pow(1.01, RZOOM.y0 - e.clientY);
+      const f = Math.max(1, Math.min(MAX_ZOOM, target)) / ZOOM.scale;
+      if(f !== 1) zoomAt(RZOOM.ax, RZOOM.ay, f);
+      return;
+    }
     if(!ZOOM.panning) return;
     ZOOM.x = ZOOM.from[2] + (e.clientX - ZOOM.from[0]);
     ZOOM.y = ZOOM.from[3] + (e.clientY - ZOOM.from[1]);
     zoomApply();
   });
-  const endPan = () => { ZOOM.panning=false; box.classList.remove('panning'); };
+  const endPan = () => { ZOOM.panning=false; RZOOM.on=false;
+                         box.classList.remove('panning'); };
   box.addEventListener('pointerup', endPan);
   box.addEventListener('pointercancel', endPan);
 }
@@ -816,6 +860,7 @@ const ED = {
   subtract:false,          // whether the outline tools add or take away
   poly:[], polyDrag:-1, polyFresh:false, lastPoly:null,
   polyState:null,          // null | 'drawing' | 'editing' -- ITK-SNAP's states
+  reverse:false,           // right-button drag: paint in reverse (erase)
   ruler:null,              // the ruler being dragged out right now
 };
 
@@ -1230,11 +1275,31 @@ function bindPane(plane){
 
   const editable = () => ED.on && plane === 'axial';
 
+  cv.addEventListener('contextmenu', e => e.preventDefault());
+
   cv.addEventListener('pointerdown', e => {
-    if(e.button !== 0 || SPACE_DOWN) return;   // space is reserved for panning
+    if(SPACE_DOWN || e.button === 1) return;   // the box pans on these
+    const tool = activeTool();
+    // Right button: reverse-paint on a brush-like tool, otherwise it is the
+    // box's zoom-drag. Ctrl+left and alt+left are ITK-SNAP's stand-ins for
+    // right and middle in crosshair mode, so those are the box's too. (On
+    // macOS ctrl+left already arrives as button 2.)
+    const rightPaint = e.button === 2 && editable() && isBrushy(tool);
+    if(e.button === 2 && !rightPaint) return;
+    if(e.button !== 0 && !rightPaint) return;
+    if(tool === 'zoom') return;
+    if(e.button === 0 && (e.ctrlKey || e.altKey) && tool === 'cross') return;
     const [u, v] = paneVoxel(plane, e);
 
-    if(!editable() || ED.tool === 'cross'){
+    // The ruler works with or without the editor -- measuring is not editing.
+    if(tool === 'ruler' && plane === 'axial' && !rightPaint){
+      cv.setPointerCapture(e.pointerId);
+      ED.ruler = {a:[u,v], b:[u,v]};
+      ED.painting = true; drawPaneOverlay('axial');
+      return;
+    }
+
+    if(!editable() || tool === 'cross'){
       // Zoomed in and not editing, a plain drag pans -- so the crosshair moves
       // on RELEASE, and only if the pointer stayed put. Acting on pointerdown
       // would yank the crosshair to wherever a pan happened to start.
@@ -1243,12 +1308,6 @@ function bindPane(plane){
     }
     cv.setPointerCapture(e.pointerId);
     const p = [u, v];
-
-    if(ED.tool === 'ruler'){
-      ED.ruler = {a:p, b:p};
-      ED.painting = true; drawPaneOverlay('axial');
-      return;
-    }
 
     if(ED.tool === 'polygon'){
       const tol = Math.max(2, Math.round(4/Math.max(1, ZOOM.scale)));
@@ -1304,9 +1363,13 @@ function bindPane(plane){
     }
 
     edPushUndo(); ED.painting = true; ED.last = p;
-    // Holding Alt inverts the tool. Far quicker than going to the toolbar and
-    // back for a two-voxel fix, which is most of what correction actually is.
-    const erase = ED.tool === 'scalpel' ? true : (ED.tool==='eraser') !== e.altKey;
+    // Holding Alt inverts the tool, and the right button does too, for the
+    // whole drag -- ITK-SNAP's reverse-paint. Both are far quicker than going
+    // to the toolbar and back for a two-voxel fix, which is most of what
+    // correction actually is.
+    ED.reverse = rightPaint;
+    const erase = ED.tool === 'scalpel' ? true
+                : ((ED.tool==='eraser') !== e.altKey) !== ED.reverse;
     if(ED.tool === 'scalpel')  edCut(p[0], p[1], p[0], p[1]);
     else if(adaptiveOn())      edAdaptive(p[0], p[1], erase);
     else                       edStamp(p[0], p[1], erase);
@@ -1314,10 +1377,13 @@ function bindPane(plane){
   });
 
   cv.addEventListener('pointermove', e => {
-    if(!ED.painting || !editable()) return;
+    if(!ED.painting) return;
+    if(activeTool() === 'ruler'){
+      if(ED.ruler){ ED.ruler.b = paneVoxel(plane, e); drawPaneOverlay('axial'); }
+      return;
+    }
+    if(!editable()) return;
     const p = paneVoxel(plane, e);
-
-    if(ED.tool === 'ruler'){ ED.ruler.b = p; drawPaneOverlay('axial'); return; }
 
     if(ED.tool === 'polygon'){
       // Dragging straight after placing a point traces freehand from it;
@@ -1331,10 +1397,10 @@ function bindPane(plane){
       polyDraw();
       return;
     }
+    const erase = ((ED.tool==='eraser') !== e.altKey) !== ED.reverse;
     if(ED.tool === 'scalpel') edCut(ED.last[0], ED.last[1], p[0], p[1]);
-    else if(adaptiveOn())     edAdaptive(p[0], p[1], (ED.tool==='eraser') !== e.altKey);
-    else edStroke(ED.last[0], ED.last[1], p[0], p[1],
-                  (ED.tool==='eraser') !== e.altKey);
+    else if(adaptiveOn())     edAdaptive(p[0], p[1], erase);
+    else edStroke(ED.last[0], ED.last[1], p[0], p[1], erase);
     ED.last = p; edRepaint();
   });
 
@@ -1345,7 +1411,7 @@ function bindPane(plane){
         moveCrosshair(c0[2], c0[3], c0[4]);
       return;
     }
-    if(ED.tool === 'ruler' && ED.ruler){
+    if(activeTool() === 'ruler' && ED.ruler){
       const r = ED.ruler; ED.ruler = null;
       if(Math.hypot(r.b[0]-r.a[0], r.b[1]-r.a[1]) >= 2){
         const k = rulerKey('axial');
@@ -1358,7 +1424,7 @@ function bindPane(plane){
     // Releasing a trace leaves the outline OPEN, in the drawing state -- the
     // traced points are ordinary vertices now, and more clicks or drags extend
     // them. Closing and accepting are explicit, exactly as in ITK-SNAP.
-    ED.painting = false; ED.last = null;
+    ED.painting = false; ED.last = null; ED.reverse = false;
     ED.polyDrag = -1; ED.polyFresh = false;
   };
   cv.addEventListener('pointerup', stop);
@@ -1425,6 +1491,7 @@ function bindEditorToolbar(){
   on('#tCut',   pick('scalpel'));
   on('#tRuler', pick('ruler'));
   on('#tCross', pick('cross'));
+  on('#tZoom',  pick('zoom'));
   on('#tMode',  () => { ED.subtract = !ED.subtract; renderDetail(); });
   document.querySelectorAll('#tShapeSeg button').forEach(btn => {
     btn.onclick = () => {
@@ -1519,8 +1586,9 @@ function toolbarHTML(){
       ${b('tErase','E','⌫ Erase','eraser','E')}
       ${b('tFill','G','◉ Fill','fill','G — fill an enclosed area, or remove a whole blob')}
       ${b('tCut','X','✂ Cut','scalpel','X — draw a line to cut the mask in two')}
-      ${b('tRuler','R','↔ Ruler','ruler','R — drag to measure a distance in mm')}
-      ${b('tCross','C','✛ Navigate','cross','C — move the crosshair without painting')}
+      ${b('tRuler','R','↔ Ruler','ruler','R or 6 — drag to measure a distance in mm')}
+      ${b('tCross','C','✛ Navigate','cross','1 — move the crosshair without painting; right-drag zooms, middle-drag pans')}
+      ${b('tZoom','Z','⤢ Zoom/pan','zoom','2 — left-drag pans, right-drag zooms')}
       <span class="sep"></span>
       <button id="tMode" title="M — whether the outline and fill tools add or take away"
         >${ED.subtract ? '− subtract' : '+ add'}</button>
