@@ -577,9 +577,98 @@ async function runE2E(win) {
     if (failures.length) { r.ok = false; r.error = failures.join('; '); }
   }
 
+  // Second phase: the keyboard map, exercised on the real UI. Reload so the
+  // page renders the imported case, click it the way a user would, then
+  // dispatch real KeyboardEvents and assert what the DOM shows.
+  if (r.ok && !E2E_VERIFY) {
+    win.webContents.reload();
+    await new Promise((res) => win.webContents.once('did-finish-load', res));
+    const ui = await win.webContents.executeJavaScript(UI_KEYS_SCRIPT, true);
+    for (const s of ui.steps) console.log(`[e2e:keys] ${s.name}:`, JSON.stringify(s.v ?? true));
+    if (!ui.ok) { r.ok = false; r.error = 'keyboard: ' + ui.error; }
+  }
+
   console.log(r.ok ? '[e2e] PASS' : `[e2e] FAIL: ${r.error}`);
   app.exit(r.ok ? 0 : 1);
 }
+
+const UI_KEYS_SCRIPT = `(async () => {
+  const out = { steps: [], ok: false };
+  const step = (n, v) => out.steps.push({ name: n, v });
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const waitFor = async (fn, ms = 30000) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) { const v = fn(); if (v) return v; await sleep(150); }
+    return null;
+  };
+  const key = (k, opts = {}) => document.dispatchEvent(new KeyboardEvent('keydown',
+    Object.assign({ key: k, bubbles: true, cancelable: true }, opts)));
+  try {
+    const item = await waitFor(() => document.querySelector('.caseitem'));
+    if (!item) throw new Error('no case in the list after reload');
+    item.click();
+    if (!await waitFor(() => {
+      const m = document.querySelector('#axMsk');
+      return m && m.style.opacity !== '';
+    })) throw new Error('the viewer did not render the case');
+
+    key('s');
+    const hidden = document.querySelector('#axMsk').style.opacity;
+    key('s');
+    const shown = document.querySelector('#axMsk').style.opacity;
+    step('S_mask_toggle', { hidden, shown });
+    if (+hidden !== 0 || +shown <= 0) throw new Error('S did not toggle the mask');
+
+    const op0 = +document.querySelector('#ctOpacity').value;
+    key('a'); key('a'); key('d');
+    const op1 = +document.querySelector('#ctOpacity').value;
+    step('AD_opacity', { op0, op1 });
+    if (op1 !== op0 - 5) throw new Error('A/D opacity steps wrong');
+
+    key('y');
+    if (!await waitFor(() => document.querySelector('.caseitem .chip.accepted'), 5000))
+      throw new Error('Y did not mark the case accepted');
+    step('Y_review');
+
+    key('3');
+    if (!await waitFor(() => document.querySelector('#edBar')))
+      throw new Error('3 did not open the editor');
+    if (!document.querySelector('#tPoly.on')) throw new Error('polygon not active after 3');
+    step('3_opens_editor_polygon');
+
+    key('4');
+    if (!await waitFor(() => document.querySelector('#tBrush.on'), 5000))
+      throw new Error('4 did not select the brush');
+    if (!document.querySelector('#tShapeSeg')) throw new Error('no brush shape control');
+    const size0 = +document.querySelector('#tSize').value;
+    key('+'); key('+'); key('-');
+    const size1 = +document.querySelector('#tSize').value;
+    step('brush_plus_minus', { size0, size1 });
+    if (size1 !== size0 + 1) throw new Error('brush +/- resize wrong');
+
+    const lab0 = document.querySelector('#axLab').textContent;
+    key('PageDown');
+    await sleep(200);
+    const lab1 = document.querySelector('#axLab').textContent;
+    step('PgDn_slice', { lab0, lab1 });
+    if (lab0 === lab1) throw new Error('PageDown did not change slice');
+
+    const sa0 = document.querySelector('#saLab').textContent;
+    key('ArrowRight', { shiftKey: true });
+    await sleep(200);
+    const sa1 = document.querySelector('#saLab').textContent;
+    step('editor_arrows_cursor', { sa0, sa1 });
+    if (sa0 === sa1) throw new Error('arrows did not move the cursor in the editor');
+
+    key('Escape');
+    if (!await waitFor(() => !document.querySelector('#edBar'), 5000))
+      throw new Error('Escape did not leave the editor');
+    step('Esc_exits_editor');
+
+    out.ok = true;
+  } catch (e) { out.error = e.message; }
+  return out;
+})()`;
 
 /* ======================= lifecycle ======================= */
 

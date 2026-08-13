@@ -25,6 +25,7 @@ import { fileNames } from './lib/pipeline.js';
 
 const $ = s => document.querySelector(s);
 let STATE=null, SEL=null, SLICE=0, OVERLAY=true;
+let ANNOT=true;    // 'X' hides annotations (rulers), like ITK-SNAP's X
 let FILTER='all', SORT='priority', QUERY='';
 
 /* Preferences that should survive a reload. Nothing here affects any number
@@ -555,7 +556,7 @@ function drawPaneOverlay(plane){
     g.moveTo(cx+.5, Math.min(h,cy+gap)); g.lineTo(cx+.5, h);
     g.stroke();
   }
-  drawRulers(plane, g);
+  if(ANNOT) drawRulers(plane, g);
   if(plane === 'axial') drawPoly(g);
 }
 
@@ -635,23 +636,38 @@ function bindDisplay(){
   const lv=$('#ctLevel'), wd=$('#ctWindow'), o=$('#ctOpacity'), r=$('#ctReset');
   if(lv) lv.oninput = e => setWL(+e.target.value, wlWidth());
   if(wd) wd.oninput = e => setWL(wlCentre(), +e.target.value);
-  if(o) o.oninput = e => { PREFS.opacity=+e.target.value; savePrefs();
-    for(const p of ['ax','co','sa']){
-      const m = $('#'+p+'Msk'); if(m) m.style.opacity = maskOpacity(); }
-    updateWLReadout(); };
+  if(o) o.oninput = e => setOpacity(+e.target.value);
   if(r) r.onclick = () => {
-    autoWindow(); PREFS.opacity=55; savePrefs();
-    if(o) o.value=55;
-    renderAllPanes(); updateWLReadout();
+    autoWindow(); setOpacity(55);
+    renderAllPanes();
     toast('Display reset to the automatic window');
   };
   updateWLReadout();
 }
 
-// "Hide mask" is a review gesture -- it answers "would I have drawn a boundary
-// there?". It must NOT survive into the editor, where painting onto an
-// invisible mask is how someone loses an afternoon.
-function maskOpacity(){ return (ED.on || OVERLAY) ? PREFS.opacity/100 : 0; }
+// One funnel for the mask opacity, shared by the slider and the A/D keys.
+function setOpacity(v){
+  PREFS.opacity = Math.max(0, Math.min(100, Math.round(v)));
+  savePrefs();
+  const o = $('#ctOpacity'); if(o) o.value = PREFS.opacity;
+  refreshOverlayOpacity(); updateWLReadout();
+}
+
+function syncOverlayBtn(){
+  const b = $('#btnOverlay');
+  if(b) b.textContent = (OVERLAY ? 'Hide' : 'Show') + ' mask';
+}
+
+function toggleOverlay(){
+  OVERLAY = !OVERLAY;
+  refreshOverlayOpacity(); syncOverlayBtn();
+}
+
+// 'S' hides the mask in the editor too now, matching ITK-SNAP -- but painting
+// onto an invisible mask is how someone loses an afternoon, so entering the
+// editor always starts visible and any mask-changing action while hidden
+// forces it back on (the hook in edPushUndo). Nobody can paint blind.
+function maskOpacity(){ return OVERLAY ? PREFS.opacity/100 : 0; }
 
 function refreshOverlayOpacity(){
   for(const p of ['ax','co','sa']){
@@ -783,6 +799,20 @@ function zoomStep(factor){
 }
 
 function zoomReset(){ ZOOM.scale=1; ZOOM.x=0; ZOOM.y=0; zoomApply(); }
+
+/* ITK-SNAP's 'C': centre the views on the cursor. The axial pane pans so the
+   crosshair sits mid-screen (as far as the never-show-past-the-edge clamp
+   allows); the reformats are drawn around the cursor by construction, and the
+   displayed slice IS the cursor's z. */
+function centerViews(){
+  const box = $('#canvas'); if(!box || !VOL.img) return;
+  const w = box.clientWidth, h = box.clientHeight, s = ZOOM.scale;
+  const px = ((CUR.x + 0.5) / VOL.nx - 0.5) * w;
+  const py = ((CUR.y + 0.5) / VOL.ny - 0.5) * h;
+  ZOOM.x = -s * px; ZOOM.y = -s * py;
+  zoomApply();
+  renderAllPanes();
+}
 
 function zoomBind(){
   const box = $('#canvas'); if(!box) return;
@@ -1197,6 +1227,12 @@ function edStroke(x0,y0,x1,y1,erase){
    once and undo would only have put one of them back. */
 function edPushUndo(){
   if(!VOL.mask) return;
+  // Every mask mutation passes through here first, which makes it the one
+  // guaranteed place to enforce: nobody paints onto an invisible mask.
+  if(ED.on && !OVERLAY){
+    OVERLAY = true; refreshOverlayOpacity(); syncOverlayBtn();
+    toast('Mask shown — it was hidden while you edited');
+  }
   ED.undo.push({data:new Uint8Array(VOL.mask), dirty:new Set(ED.dirty)});
   if(ED.undo.length > 25) ED.undo.shift();
   ED.redo.length = 0;
@@ -1213,6 +1249,7 @@ function edApplySnapshot(stack, other){
 
 async function edEnter(){
   ED.on = true;
+  OVERLAY = true;      // the editor always starts with the mask visible
   ED.dirty.clear();
   ED.undo.length = 0; ED.redo.length = 0;
   ED.poly = []; ED.polyDrag = -1; ED.polyState = null;
@@ -1256,6 +1293,31 @@ function paneVoxel(plane, e){
   const u = Math.floor((e.clientX-r.left)/r.width  * P.W());
   const v = Math.floor((e.clientY-r.top) /r.height * P.H());
   return [Math.max(0, Math.min(P.W()-1, u)), Math.max(0, Math.min(P.H()-1, v))];
+}
+
+// Arrow keys in the editor: move the cursor by voxels, ITK-SNAP style.
+function moveCursorBy(dx, dy){
+  if(!VOL.img) return;
+  CUR.x = Math.max(0, Math.min(VOL.nx-1, CUR.x+dx));
+  CUR.y = Math.max(0, Math.min(VOL.ny-1, CUR.y+dy));
+  renderAllPanes();
+}
+
+/* One entry point for tool selection, from buttons and keys alike. The
+   navigation tools switch in place; a mask tool chosen outside the editor
+   OPENS the editor with it -- ITK-SNAP has no separate edit mode, so the tool
+   keys behave as though we did not either. */
+function selectTool(t){
+  if(!SEL) return;
+  if(ED.on || NAV_TOOLS.includes(t)){
+    ED.tool = t;
+    if(t !== 'polygon') polyReset();
+    PREFS.tool = t; savePrefs();
+    renderDetail();
+    return;
+  }
+  PREFS.tool = t; savePrefs();
+  edEnter();
 }
 
 function moveCrosshair(plane, u, v){
@@ -1478,11 +1540,7 @@ function bindPolyBar(){
 }
 
 function bindEditorToolbar(){
-  const pick = t => () => {
-    ED.tool = t;
-    if(t!=='polygon') polyReset();
-    PREFS.tool = t; savePrefs(); renderDetail();
-  };
+  const pick = t => () => selectTool(t);
   const on = (id, fn) => { const el = $(id); if(el) el.onclick = fn; };
   on('#tPoly',  pick('polygon'));
   on('#tBrush', pick('brush'));
@@ -1698,7 +1756,7 @@ function renderDetail(){
           tsl.map(i=>`<i style="left:${c.n_slices>1?100*i/(c.n_slices-1):50}%"
              title="slice ${i+1}"></i>`).join('')}</div>
         <div class="row" style="margin-top:8px;flex-wrap:wrap">
-          ${ED.on ? '' : `<button id="btnOverlay">${OVERLAY?'Hide':'Show'} mask</button>`}
+          <button id="btnOverlay" title="S">${OVERLAY?'Hide':'Show'} mask</button>
           ${(!ED.on && tsl.length)?`<button id="btnJump">Jump to tumour</button>`:''}
           <button id="btnEdit" class="${ED.on?'primary':''}">${
             ED.on ? 'Stop editing' : 'Edit mask here'}</button>
@@ -1794,11 +1852,7 @@ function renderDetail(){
   };
   window._setSlice = setSlice;
   $('#scrub').oninput = e => setSlice(+e.target.value);
-  if($('#btnOverlay')) $('#btnOverlay').onclick = () => {
-    OVERLAY = !OVERLAY;
-    $('#btnOverlay').textContent = (OVERLAY?'Hide':'Show') + ' mask';
-    refreshOverlayOpacity();
-  };
+  if($('#btnOverlay')) $('#btnOverlay').onclick = toggleOverlay;
   if($('#btnJump')) $('#btnJump').onclick =
     () => setSlice(tsl[Math.floor(tsl.length/2)]);
   $('#btnEdit').onclick = () => {
@@ -2311,41 +2365,76 @@ function isTypingTarget(t){
 }
 const isRange = t => t.tagName === 'INPUT' && t.type === 'range';
 
+/* The dispatch clones ITK-SNAP's shortcut map (taken from its own source: the
+   MainImageWindow accelerators and the interaction modes), with the worklist
+   as the one deliberate departure -- ITK-SNAP has no notion of reviewing many
+   scans, so view mode keeps arrow-key scan/slice navigation and gains Y/N for
+   review verdicts. */
+function adjustBrushRadius(delta){
+  ED.radius = Math.max(1, Math.min(40, ED.radius + delta));
+  PREFS.radius = ED.radius; savePrefs();
+  const s=$('#tSize'); if(s) s.value=ED.radius;
+  const l=$('#edSize'); if(l) l.textContent=brushLabel();
+}
+
 document.addEventListener('keydown', e => {
   if(isTypingTarget(e.target)) return;
   if($('#main').style.display==='none') return;
   const k = e.key.toLowerCase();
+  const mod = e.metaKey || e.ctrlKey;
 
+  /* ---- everywhere ---- */
   if(e.key==='?'){ e.preventDefault(); helpOpen(true); return; }
   if(e.key==='Escape' && $('#help').classList.contains('open')){
     helpOpen(false); return; }
   // Space is hold-to-pan, so it must not also scroll the page.
   if(e.code==='Space'){ SPACE_DOWN=true; e.preventDefault(); return; }
-  if(e.key==='+' || e.key==='='){ e.preventDefault(); zoomStep(1.25); return; }
-  if(e.key==='-' || e.key==='_'){ e.preventDefault(); zoomStep(1/1.25); return; }
-  if(e.key==='0'){ e.preventDefault(); zoomReset(); return; }
-  // Layout keys work in both modes, so T and H rather than a letter the editor
-  // already wants for a tool.
-  if(k==='t' && SEL){ e.preventDefault();
-    PREFS.threeUp = !PREFS.threeUp; savePrefs(); renderDetail(); return; }
-  if(k==='h' && SEL){ e.preventDefault();
-    PREFS.crosshair = PREFS.crosshair === false; savePrefs(); renderDetail(); return; }
 
-  if(ED.on){
-    // Editing shortcuts take priority, and A/F are NOT bound here -- typing
-    // them mid-edit should not silently mark a half-finished mask as accepted.
-    if((e.metaKey||e.ctrlKey) && k==='z'){
+  if(mod && k==='z' && ED.on){
+    e.preventDefault();
+    e.shiftKey ? edApplySnapshot(ED.redo, ED.undo)
+               : edApplySnapshot(ED.undo, ED.redo);
+    return;
+  }
+  if(mod && k==='s' && ED.on){ e.preventDefault(); edSave(); return; }
+  if(mod && k==='j' && SEL){                       // ITK-SNAP: auto contrast
+    e.preventDefault();
+    autoWindow(); renderAllPanes(); updateWLReadout();
+    toast('Contrast set from the image'); return; }
+  if(mod && k==='f' && SEL){ e.preventDefault(); zoomReset(); return; }  // zoom to fit
+  if(mod) return;   // leave every other browser shortcut alone
+
+  if(SEL){
+    if(k==='s'){ e.preventDefault(); toggleOverlay(); return; }     // hide/show mask
+    if(k==='a' || k==='d'){                                          // opacity down/up
       e.preventDefault();
-      e.shiftKey ? edApplySnapshot(ED.redo, ED.undo)
-                 : edApplySnapshot(ED.undo, ED.redo);
+      if((PREFS.reviewKeyNote|0) < 3 && !ED.on && k==='a'){
+        PREFS.reviewKeyNote = (PREFS.reviewKeyNote|0)+1; savePrefs();
+        toast('Review keys moved: Y marks correct, N flags. A/D now change mask opacity.');
+      }
+      if(k==='d' && !OVERLAY) toggleOverlay();   // raising opacity implies visible
+      setOpacity(PREFS.opacity + (k==='a' ? -5 : 5));
       return;
     }
-    if((e.metaKey||e.ctrlKey) && k==='s'){ e.preventDefault(); edSave(); return; }
+    if(k==='x'){                                   // annotations; shift+X crosshair
+      e.preventDefault();
+      if(e.shiftKey){ PREFS.crosshair = PREFS.crosshair === false; savePrefs(); }
+      else ANNOT = !ANNOT;
+      renderAllPanes(); return;
+    }
+    if(k==='c'){ e.preventDefault(); centerViews(); return; }
+    if(k==='t'){ e.preventDefault();
+      PREFS.threeUp = !PREFS.threeUp; savePrefs(); renderDetail(); return; }
+    if(k==='h'){ e.preventDefault();
+      PREFS.crosshair = PREFS.crosshair === false; savePrefs(); renderDetail(); return; }
+    if(e.key==='0'){ e.preventDefault(); zoomReset(); return; }
+    if(e.key==='PageDown' && window._setSlice){
+      e.preventDefault(); window._setSlice(SLICE+1); return; }
+    if(e.key==='PageUp' && window._setSlice){
+      e.preventDefault(); window._setSlice(SLICE-1); return; }
 
-    // Outline keys come first: Enter/Backspace/Esc mean something specific
-    // while an outline is open. Enter closes an open outline, then accepts a
-    // closed one -- polyAccept routes by state.
-    if(ED.tool==='polygon'){
+    /* ---- outline keys, before tool selection claims their letters ---- */
+    if(ED.on && ED.tool==='polygon'){
       if(e.key==='Enter'){ e.preventDefault(); polyAccept(); return; }
       if(e.key==='Backspace' && ED.polyState!=='editing'){
         e.preventDefault(); (ED.poly||[]).pop();
@@ -2355,21 +2444,47 @@ document.addEventListener('keydown', e => {
         e.preventDefault(); polyReset(); toast('Outline discarded'); return; }
       if(k==='v'){ polyPaste(); return; }
     }
-    const tk = {p:'polygon', b:'brush', e:'eraser',
-                g:'fill', x:'scalpel', r:'ruler', c:'cross'}[k];
-    if(tk){ ED.tool=tk; if(tk!=='polygon') polyReset();
-            PREFS.tool=tk; savePrefs(); renderDetail(); return; }
-    if(k==='m'){ ED.subtract=!ED.subtract; renderDetail(); return; }
-    if(e.key==='[' || e.key===']'){
-      ED.radius = e.key==='[' ? Math.max(1, ED.radius-1) : Math.min(40, ED.radius+1);
-      PREFS.radius = ED.radius; savePrefs();
-      const s=$('#tSize'); if(s) s.value=ED.radius;
-      const l=$('#edSize'); if(l) l.textContent=brushLabel();
+
+    /* ---- tool selection: ITK-SNAP's 1-6, plus letter aliases ---- */
+    const tool = {'1':'cross', '2':'zoom', '3':'polygon', 'p':'polygon',
+                  '4':'brush', 'b':'brush', '6':'ruler', 'r':'ruler'}[k];
+    if(tool){ e.preventDefault(); selectTool(tool); return; }
+    if(k==='5'){
+      e.preventDefault();
+      toast("The snake tool's job is done by the trained model here — scans "
+          + 'arrive pre-segmented. Use Polygon (3) or Brush (4) to correct.');
       return;
     }
-    if(e.key==='Escape'){ if(edConfirmLeave()) edExit(); return; }
   }
 
+  if(ED.on){
+    const tk = {e:'eraser', g:'fill', k:'scalpel'}[k];
+    if(tk){ selectTool(tk); return; }
+    if(k==='m'){ ED.subtract=!ED.subtract; renderDetail(); return; }
+    if(e.key==='[' || e.key===']'){ adjustBrushRadius(e.key==='[' ? -1 : 1); return; }
+    // +/- are ITK-SNAP's brush-size keys; on other tools they stay zoom.
+    if(e.key==='+' || e.key==='=' || e.key==='-' || e.key==='_'){
+      e.preventDefault();
+      const grow = e.key==='+' || e.key==='=';
+      if(isBrushy(ED.tool)) adjustBrushRadius(grow ? 1 : -1);
+      else zoomStep(grow ? 1.25 : 1/1.25);
+      return;
+    }
+    // Arrows move the cursor by a voxel, five with Shift -- never the slice.
+    if(!isRange(e.target)){
+      const d = {ArrowRight:[1,0], ArrowLeft:[-1,0],
+                 ArrowDown:[0,1], ArrowUp:[0,-1]}[e.key];
+      if(d){ e.preventDefault();
+        const s = e.shiftKey ? 5 : 1;
+        moveCursorBy(d[0]*s, d[1]*s); return; }
+    }
+    if(e.key==='Escape'){ if(edConfirmLeave()) edExit(); return; }
+    return;
+  }
+
+  /* ---- view mode ---- */
+  if(e.key==='+' || e.key==='='){ e.preventDefault(); zoomStep(1.25); return; }
+  if(e.key==='-' || e.key==='_'){ e.preventDefault(); zoomStep(1/1.25); return; }
   // With focus on a slider the browser already moves it, and for the scrubber
   // that fires oninput and changes the slice. Handling the arrow here as well
   // would advance two slices per press.
@@ -2379,9 +2494,12 @@ document.addEventListener('keydown', e => {
     if(e.key==='ArrowDown'){ e.preventDefault(); step(1); }
     if(e.key==='ArrowUp'){ e.preventDefault(); step(-1); }
   }
-  if(ED.on) return;
-  if(k==='a' && SEL) review('accepted');
-  if(k==='f' && SEL) review('flagged');
+  if(k==='y' && SEL) review('accepted');
+  if(k==='n' && SEL) review('flagged');
+  if(k==='f' && SEL && (PREFS.reviewKeyNote|0) < 3){
+    PREFS.reviewKeyNote = (PREFS.reviewKeyNote|0)+1; savePrefs();
+    toast('Review keys moved: Y marks correct, N flags.');
+  }
 });
 
 // Losing hand-drawn work to a stray click or a closed tab would be
