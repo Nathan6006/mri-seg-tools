@@ -31,7 +31,7 @@ let FILTER='all', SORT='priority', QUERY='';
    that gets stored -- these are display and workflow settings only. */
 const PREFS = Object.assign({
   opacity:55, radius:6, autoNext:false, threeUp:true, crosshair:true,
-  brushShape:'round', brush3d:false, adaptTol:8, freehandAuto:true,
+  brushShape:'round', brush3d:false, adaptTol:8,
 }, JSON.parse(localStorage.getItem('mriseg.prefs') || '{}'));
 const savePrefs = () => localStorage.setItem('mriseg.prefs', JSON.stringify(PREFS));
 
@@ -43,7 +43,11 @@ const savePrefs = () => localStorage.setItem('mriseg.prefs', JSON.stringify(PREF
 if(PREFS.square !== undefined && !JSON.parse(localStorage.getItem('mriseg.prefs')||'{}').brushShape)
   PREFS.brushShape = PREFS.square ? 'square' : 'round';
 if(PREFS.tool === 'adaptive'){ PREFS.tool = 'brush'; PREFS.brushShape = 'adaptive'; }
-delete PREFS.square;
+// Freehand merged into the polygon tool: click adds a vertex, press-drag
+// traces a curve, exactly ITK-SNAP's polygon. The auto-fill-on-release
+// preference goes with it -- closing and accepting are explicit now.
+if(PREFS.tool === 'freehand') PREFS.tool = 'polygon';
+delete PREFS.square; delete PREFS.freehandAuto;
 
 // There is no server to lose contact with any more, so the old offline banner
 // is now the storage banner: the one comparable way this build can quietly
@@ -806,11 +810,12 @@ const ED = {
   on:false,
   dirty:new Set(),     // slices changed since the last save
   undo:[], redo:[],
-  tool:'freehand', radius:6, painting:false, last:null,
+  tool:'polygon', radius:6, painting:false, last:null,
   shape:'round',           // brush shape: round | square | adaptive
   brush3d:false, adaptTol:8,
   subtract:false,          // whether the outline tools add or take away
-  poly:[], polyDrag:-1, polyFresh:false, lastPoly:null, tracing:false,
+  poly:[], polyDrag:-1, polyFresh:false, lastPoly:null,
+  polyState:null,          // null | 'drawing' | 'editing' -- ITK-SNAP's states
   ruler:null,              // the ruler being dragged out right now
 };
 
@@ -849,8 +854,8 @@ slice-by-slice tracing fast, because a tumour barely changes between slices.
 Nothing touches the mask until Accept. The outline lives on its own canvas so
 cancelling is guaranteed to leave no trace.
 */
-function polyReset(){ ED.poly = []; ED.polyDrag = -1; polyDraw(); }
-function polyDraw(){ drawPaneOverlay('axial'); polyHint(); }
+function polyReset(){ ED.poly = []; ED.polyDrag = -1; ED.polyState = null; polyDraw(); }
+function polyDraw(){ drawPaneOverlay('axial'); polyBarSync(); }
 
 function drawPoly(g){
   const p = ED.poly || [];
@@ -862,35 +867,65 @@ function drawPoly(g){
   g.beginPath();
   g.moveTo(p[0][0]+.5, p[0][1]+.5);
   for(let i=1;i<p.length;i++) g.lineTo(p[i][0]+.5, p[i][1]+.5);
-  if(p.length > 2){ g.closePath(); g.fill(); }
+  // While drawing, the outline stays open -- closing is an explicit act, the
+  // way ITK-SNAP's polygon works. Once closed, the fill preview shows what
+  // Accept would paint.
+  if(ED.polyState === 'editing' && p.length > 2){ g.closePath(); g.fill(); }
   g.stroke();
-  // A freehand trace is a smooth curve with no editable vertices -- drawing
-  // hundreds of handles on it would be noise. ITK-SNAP draws the same
-  // distinction between a smooth curve and a polygon.
-  if(!ED.tracing && ED.tool === 'polygon'){
-    const r = Math.max(1, 2.4/scale);
+  const r = Math.max(1, 2.4/scale);
+  if(ED.polyState === 'editing'){
+    // Every vertex is a handle in the editing state, traced curves included.
     for(let i=0;i<p.length;i++){
       g.beginPath(); g.arc(p[i][0]+.5, p[i][1]+.5, r, 0, 6.284);
-      g.fillStyle = i===0 ? '#fbbf24' : '#38bdf8'; g.fill();
+      g.fillStyle = '#38bdf8'; g.fill();
     }
+  } else {
+    // While drawing, only the first vertex gets a handle: it is the close
+    // target. Click it (or press Enter) to close the outline.
+    g.beginPath(); g.arc(p[0][0]+.5, p[0][1]+.5, r*1.4, 0, 6.284);
+    g.fillStyle = '#fbbf24'; g.fill();
   }
 }
 
 function polyHint(){
   const hint = $('#polyHint'); if(!hint) return;
   const p = ED.poly || [];
-  if(ED.tool === 'freehand'){
-    hint.textContent = !p.length
-      ? 'Press and drag right round the tumour boundary. Let go and it fills.'
-      : `${p.length} points traced.` + (PREFS.freehandAuto ? '' : ' Accept to fill.');
+  if(ED.polyState === 'editing'){
+    hint.textContent = `${p.length} points. Drag one to move it, shift-click to `
+      + `delete, click an edge to insert. Enter accepts.`;
     return;
   }
   hint.textContent = !p.length
-    ? 'Click points around the edge. Drag between points to trace freehand.'
+    ? 'Click to add points, or press and drag to trace a curve. Mix both freely.'
     : p.length < 3
       ? `${p.length} point${p.length>1?'s':''} — at least 3 are needed.`
-      : `${p.length} points. Drag to move one, shift-click to delete, click an `
-        + `edge to insert. Then Accept.`;
+      : `${p.length} points. Click the first point or press Enter to close.`;
+}
+
+/* The polygon bar shows different actions in the two states, like the buttons
+   under an ITK-SNAP slice view. It is re-rendered only when the state actually
+   changes -- polyDraw() runs on every pointermove of a trace, and churning
+   innerHTML there would break the drag. */
+function polyBarHTML(){
+  const btns = ED.polyState === 'editing'
+    ? `<button id="pCancel" title="Esc">Clear</button>
+       <button id="pAccept" class="primary" title="Enter — fill the outline">Accept ⏎</button>`
+    : `<button id="pPaste" title="Reuse the last outline you accepted — V">Paste last</button>
+       <button id="pUndoPt" title="Backspace">Remove point</button>
+       <button id="pCancel" title="Esc">Clear</button>
+       <button id="pComplete" class="primary" title="Enter — connect the last point to the first">Close ⏎</button>`;
+  return `<span id="polyHint"></span><span class="spacer"></span>${btns}`;
+}
+
+let POLYBAR_KEY = null;
+function polyBarSync(){
+  const bar = $('#polyBar'); if(!bar) return;
+  if(ED.polyState !== POLYBAR_KEY){
+    POLYBAR_KEY = ED.polyState;
+    bar.innerHTML = polyBarHTML();
+    bindPolyBar();
+  }
+  polyHint();
 }
 
 // Even-odd scanline fill. Works for concave outlines and self-intersections,
@@ -918,7 +953,18 @@ function polyFill(pts, value){
   return n;
 }
 
+/* Close the outline: DRAWING -> EDITING. The last point connects to the first
+   and the vertices become draggable handles. ITK-SNAP's 'complete'. */
+function polyComplete(){
+  if(!ED.poly || ED.poly.length < 3) return toast('Need at least 3 points', true);
+  ED.polyState = 'editing';
+  ED.polyFresh = false; ED.polyDrag = -1;
+  polyDraw();
+}
+
 function polyAccept(quiet){
+  // Enter means "next step": close an open outline first, fill a closed one.
+  if(ED.polyState !== 'editing') return polyComplete();
   if(!ED.poly || ED.poly.length < 3){
     if(!quiet) toast('Need at least 3 points', true);
     return;
@@ -935,6 +981,9 @@ function polyPaste(){
   if(!ED.lastPoly || ED.lastPoly.length < 3)
     return toast('No polygon to paste yet — accept one first', true);
   ED.poly = ED.lastPoly.map(p => [...p]);
+  // A pasted outline is already closed, so it lands in the editing state --
+  // nudge the handles, then Accept. Same as ITK-SNAP's paste-last-polygon.
+  ED.polyState = 'editing';
   polyDraw();
   toast('Pasted. Nudge the points, then Accept.');
 }
@@ -1121,8 +1170,8 @@ async function edEnter(){
   ED.on = true;
   ED.dirty.clear();
   ED.undo.length = 0; ED.redo.length = 0;
-  ED.poly = []; ED.polyDrag = -1;
-  ED.tool = PREFS.tool || 'freehand';
+  ED.poly = []; ED.polyDrag = -1; ED.polyState = null;
+  ED.tool = PREFS.tool || 'polygon';
   ED.radius = PREFS.radius;
   ED.shape = PREFS.brushShape || 'round';
   ED.brush3d = !!PREFS.brush3d;
@@ -1135,7 +1184,7 @@ function edExit(){
   ED.on = false;
   ED.dirty.clear();
   ED.undo.length = 0; ED.redo.length = 0;
-  ED.poly = [];
+  ED.poly = []; ED.polyState = null;
   invalidateMask();     // re-read from disk; anything unsaved is gone by design
   renderDetail();
 }
@@ -1201,30 +1250,39 @@ function bindPane(plane){
       return;
     }
 
-    if(ED.tool === 'freehand'){
-      ED.poly = [p]; ED.tracing = true; ED.painting = true;
-      polyDraw();
-      return;
-    }
-
     if(ED.tool === 'polygon'){
-      ED.tracing = false;
       const tol = Math.max(2, Math.round(4/Math.max(1, ZOOM.scale)));
-      const hit = (ED.poly||[]).findIndex(q =>
-        Math.abs(p[0]-q[0]) <= tol && Math.abs(p[1]-q[1]) <= tol);
-      if(hit >= 0){
-        // Shift-click removes a vertex; ITK-SNAP calls this trimming. Plain
-        // click grabs it to drag.
-        if(e.shiftKey){ ED.poly.splice(hit, 1); polyDraw(); return; }
-        ED.polyDrag = hit; ED.polyFresh = false;
-      } else {
-        const seg = nearestSegment(p, tol*1.5);
-        if(seg >= 0){
-          // Clicking an edge inserts a point there -- ITK-SNAP's split.
-          ED.poly.splice(seg+1, 0, p); ED.polyDrag = seg+1; ED.polyFresh = false;
+      if(ED.polyState === 'editing'){
+        // The outline is closed: clicks adjust it, they never extend it.
+        const hit = ED.poly.findIndex(q =>
+          Math.abs(p[0]-q[0]) <= tol && Math.abs(p[1]-q[1]) <= tol);
+        if(hit >= 0){
+          // Shift-click removes a vertex; ITK-SNAP calls this trimming. Plain
+          // click grabs it to drag.
+          if(e.shiftKey){
+            ED.poly.splice(hit, 1);
+            if(!ED.poly.length) ED.polyState = null;
+            polyDraw(); return;
+          }
+          ED.polyDrag = hit; ED.polyFresh = false;
         } else {
-          ED.poly.push(p); ED.polyDrag = ED.poly.length-1; ED.polyFresh = true;
+          const seg = nearestSegment(p, tol*1.5);
+          if(seg >= 0){
+            // Clicking an edge inserts a point there -- ITK-SNAP's split.
+            ED.poly.splice(seg+1, 0, p); ED.polyDrag = seg+1; ED.polyFresh = false;
+          } else return;      // a click elsewhere does nothing to a closed outline
         }
+      } else {
+        // Drawing: a click near the first point closes the outline; any other
+        // click appends a vertex, and dragging from it traces a curve.
+        const first = (ED.poly||[])[0];
+        if(first && ED.poly.length >= 3
+           && Math.abs(p[0]-first[0]) <= tol && Math.abs(p[1]-first[1]) <= tol){
+          polyComplete();
+          return;
+        }
+        ED.poly.push(p); ED.polyDrag = ED.poly.length-1; ED.polyFresh = true;
+        ED.polyState = 'drawing';
       }
       ED.painting = true; polyDraw();
       return;
@@ -1261,13 +1319,6 @@ function bindPane(plane){
 
     if(ED.tool === 'ruler'){ ED.ruler.b = p; drawPaneOverlay('axial'); return; }
 
-    if(ED.tool === 'freehand'){
-      const last = ED.poly[ED.poly.length-1];
-      if(!last || Math.abs(p[0]-last[0]) > 0 || Math.abs(p[1]-last[1]) > 0)
-        ED.poly.push(p);
-      polyDraw();
-      return;
-    }
     if(ED.tool === 'polygon'){
       // Dragging straight after placing a point traces freehand from it;
       // dragging an existing point moves it.
@@ -1304,14 +1355,9 @@ function bindPane(plane){
       }
       drawPaneOverlay('axial');
     }
-    // A freehand trace is finished when the button comes up. ITK-SNAP still
-    // asks for Accept; here that is a preference, default off, because "trace
-    // it and it fills" is what people expect from a lasso.
-    if(ED.tool === 'freehand' && ED.tracing){
-      ED.tracing = false;
-      if(PREFS.freehandAuto) polyAccept(true);
-      else polyHint();
-    }
+    // Releasing a trace leaves the outline OPEN, in the drawing state -- the
+    // traced points are ordinary vertices now, and more clicks or drags extend
+    // them. Closing and accepting are explicit, exactly as in ITK-SNAP.
     ED.painting = false; ED.last = null;
     ED.polyDrag = -1; ED.polyFresh = false;
   };
@@ -1350,14 +1396,28 @@ function nearestSegment(p, tol){
   return best;
 }
 
+// The polygon bar's buttons are re-created whenever the state changes, so
+// their bindings live in their own function that polyBarSync can re-run.
+function bindPolyBar(){
+  const on = (id, fn) => { const el = $(id); if(el) el.onclick = fn; };
+  on('#pAccept',   () => polyAccept());
+  on('#pComplete', polyComplete);
+  on('#pCancel',   () => { polyReset(); toast('Outline discarded'); });
+  on('#pPaste',    polyPaste);
+  on('#pUndoPt',   () => {
+    (ED.poly||[]).pop();
+    if(!(ED.poly||[]).length) ED.polyState = null;
+    polyDraw();
+  });
+}
+
 function bindEditorToolbar(){
   const pick = t => () => {
     ED.tool = t;
-    if(t!=='polygon' && t!=='freehand') polyReset();
+    if(t!=='polygon') polyReset();
     PREFS.tool = t; savePrefs(); renderDetail();
   };
   const on = (id, fn) => { const el = $(id); if(el) el.onclick = fn; };
-  on('#tFree',  pick('freehand'));
   on('#tPoly',  pick('polygon'));
   on('#tBrush', pick('brush'));
   on('#tErase', pick('eraser'));
@@ -1375,10 +1435,8 @@ function bindEditorToolbar(){
   on('#t3d',    () => { ED.brush3d = !ED.brush3d; PREFS.brush3d = ED.brush3d;
                         savePrefs(); renderDetail(); });
   on('#tInterp', edInterpolate);
-  on('#pAccept', () => polyAccept());
-  on('#pCancel', () => { polyReset(); toast('Outline discarded'); });
-  on('#pPaste',  polyPaste);
-  on('#pUndoPt', () => { (ED.poly||[]).pop(); polyDraw(); });
+  POLYBAR_KEY = ED.polyState;      // the bar was just rendered for this state
+  bindPolyBar();
   on('#tUndo',   () => edApplySnapshot(ED.undo, ED.redo));
   on('#tRedo',   () => edApplySnapshot(ED.redo, ED.undo));
   on('#tClear',  () => { edPushUndo(); sliceMask(SLICE).fill(0);
@@ -1401,9 +1459,6 @@ function bindEditorToolbar(){
     ED.adaptTol = +e.target.value; PREFS.adaptTol = ED.adaptTol; savePrefs();
     const s = $('#edTol'); if(s) s.textContent = ED.adaptTol+'%';
   };
-  const fa = $('#tFreeAuto');
-  if(fa) fa.onchange = e => { PREFS.freehandAuto = e.target.checked; savePrefs();
-                              polyHint(); };
 }
 
 // The brush size in voxels means little on its own -- 6 voxels is 0.97 mm here.
@@ -1459,8 +1514,7 @@ function toolbarHTML(){
   const brushy = isBrushy(ED.tool);
   return `
     <div id="edBar">
-      ${b('tFree','F','✎ Freehand','freehand','F — trace round the boundary and let go')}
-      ${b('tPoly','P','◇ Polygon','polygon','P — click points, adjust them, then Accept')}
+      ${b('tPoly','P','◇ Polygon','polygon','P — click points or drag to trace; close, adjust, then Accept')}
       ${b('tBrush','B','● Brush','brush','B — paint voxels; right-drag erases')}
       ${b('tErase','E','⌫ Erase','eraser','E')}
       ${b('tFill','G','◉ Fill','fill','G — fill an enclosed area, or remove a whole blob')}
@@ -1507,17 +1561,8 @@ function toolbarHTML(){
       <button id="tDiscard">Discard</button>
       <button id="tSave" class="primary">Save mask</button>
     </div>
-    ${(ED.tool==='polygon' || ED.tool==='freehand') ? `
-    <div id="polyBar">
-      <span id="polyHint"></span>
-      <span class="spacer"></span>
-      ${ED.tool==='freehand' ? `<label class="chk"><input type="checkbox"
-         id="tFreeAuto" ${PREFS.freehandAuto?'checked':''}> fill when I let go</label>` : ''}
-      <button id="pPaste" title="Reuse the last outline you accepted — V">Paste last</button>
-      ${ED.tool==='polygon' ? `<button id="pUndoPt" title="Backspace">Remove point</button>` : ''}
-      <button id="pCancel" title="Esc">Cancel</button>
-      <button id="pAccept" class="primary" title="Enter">Accept ⏎</button>
-    </div>` : ''}`;
+    ${ED.tool==='polygon' ? `
+    <div id="polyBar">${polyBarHTML()}</div>` : ''}`;
 }
 
 function renderDetail(){
@@ -1674,7 +1719,7 @@ function renderDetail(){
       // An outline belongs to the slice it was drawn on, so leaving without
       // accepting discards it -- carrying it over would fill the wrong slice.
       // `lastPoly` survives, so Paste still works.
-      ED.poly = [];
+      ED.poly = []; ED.polyState = null;
       toast('Outline discarded — it was not accepted before changing slice');
     }
     renderAllPanes();
@@ -2230,17 +2275,21 @@ document.addEventListener('keydown', e => {
     if((e.metaKey||e.ctrlKey) && k==='s'){ e.preventDefault(); edSave(); return; }
 
     // Outline keys come first: Enter/Backspace/Esc mean something specific
-    // while an outline is open.
-    if(ED.tool==='polygon' || ED.tool==='freehand'){
+    // while an outline is open. Enter closes an open outline, then accepts a
+    // closed one -- polyAccept routes by state.
+    if(ED.tool==='polygon'){
       if(e.key==='Enter'){ e.preventDefault(); polyAccept(); return; }
-      if(e.key==='Backspace'){ e.preventDefault(); (ED.poly||[]).pop(); polyDraw(); return; }
+      if(e.key==='Backspace' && ED.polyState!=='editing'){
+        e.preventDefault(); (ED.poly||[]).pop();
+        if(!(ED.poly||[]).length) ED.polyState = null;
+        polyDraw(); return; }
       if(e.key==='Escape' && (ED.poly||[]).length){
         e.preventDefault(); polyReset(); toast('Outline discarded'); return; }
       if(k==='v'){ polyPaste(); return; }
     }
-    const tk = {f:'freehand', p:'polygon', b:'brush', e:'eraser',
+    const tk = {p:'polygon', b:'brush', e:'eraser',
                 g:'fill', x:'scalpel', r:'ruler', c:'cross'}[k];
-    if(tk){ ED.tool=tk; if(tk!=='polygon' && tk!=='freehand') polyReset();
+    if(tk){ ED.tool=tk; if(tk!=='polygon') polyReset();
             PREFS.tool=tk; savePrefs(); renderDetail(); return; }
     if(k==='m'){ ED.subtract=!ED.subtract; renderDetail(); return; }
     if(e.key==='[' || e.key===']'){
