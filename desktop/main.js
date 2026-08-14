@@ -648,6 +648,65 @@ const UI_KEYS_SCRIPT = `(async () => {
     if (!document.querySelector('#tPoly.on')) throw new Error('polygon not active after 3');
     step('3_opens_editor_polygon');
 
+    // The freehand gesture, exactly as a hand would make it: trace a loop and
+    // let go back at the start. ITK-SNAP closes the outline on that release;
+    // so must we. Then Enter accepts, and undo puts the mask back.
+    {
+      const ovr = document.querySelector('#axOvr');
+      // The editor lays itself out asynchronously: the volume load resizes
+      // the canvases when it lands, and tracing against a rect measured
+      // mid-settle puts every point somewhere else than intended. Wait for
+      // the axial canvas to be sized to the volume (renderPane ran), then for
+      // the pane to hold still for half a second.
+      const img = document.querySelector('#axImg');
+      if (!await waitFor(() => img.width > 0 && img.width !== 300, 30000))
+        throw new Error('the axial canvas was never sized to the volume');
+      let r = null, still = 0;
+      for (let prev = null, i = 0; i < 200 && still < 4; i++) {
+        const cur = ovr.getBoundingClientRect();
+        const same = prev && Math.abs(cur.top - prev.top) < 0.5
+          && Math.abs(cur.left - prev.left) < 0.5
+          && Math.abs(cur.width - prev.width) < 0.5
+          && Math.abs(cur.height - prev.height) < 0.5;
+        still = same ? still + 1 : 0;
+        prev = cur; r = cur;
+        await sleep(150);
+      }
+      if (still < 4) throw new Error('the pane never stopped moving');
+      const pt = (t, x, y, extra = {}) => ovr.dispatchEvent(new PointerEvent(t,
+        Object.assign({ bubbles: true, cancelable: true, pointerId: 7,
+                        button: 0, buttons: 1, clientX: x, clientY: y }, extra)));
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2, rad = r.width * 0.2;
+      // A gesture must not move the page: the pane shifting mid-stroke was a
+      // real bug once (an empty hint filling in on the first click), so the
+      // harness asserts layout stillness across the whole trace.
+      const h0 = ovr.getBoundingClientRect();
+      pt('pointerdown', cx + rad, cy);
+      for (let i = 1; i <= 40; i++) {
+        const a = i / 40 * 2 * Math.PI;
+        pt('pointermove', cx + rad * Math.cos(a), cy + rad * Math.sin(a));
+      }
+      const h1 = ovr.getBoundingClientRect();
+      if (Math.abs(h1.top - h0.top) > 0.5 || Math.abs(h1.width - h0.width) > 0.5)
+        throw new Error('the pane moved mid-trace: '
+          + JSON.stringify([h0.top, h0.width]) + ' -> ' + JSON.stringify([h1.top, h1.width]));
+      step('layout_still_during_trace');
+      pt('pointerup', cx + rad, cy, { buttons: 0 });
+      await sleep(200);
+      if (!document.querySelector('#pAccept'))
+        throw new Error('a trace released at its start did not close the outline');
+      step('freehand_trace_closes_on_release');
+      key('Enter');
+      await sleep(200);
+      if (document.querySelector('#pAccept')) throw new Error('Enter did not accept the outline');
+      if (!document.querySelector('#edStats2 .dirty')) throw new Error('accept did not fill anything');
+      step('freehand_accept_fills');
+      key('z', { metaKey: true });
+      await sleep(200);
+      if (document.querySelector('#edStats2 .dirty')) throw new Error('undo did not restore the mask');
+      step('undo_restores');
+    }
+
     key('4');
     if (!await waitFor(() => document.querySelector('#tBrush.on'), 5000))
       throw new Error('4 did not select the brush');

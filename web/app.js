@@ -841,7 +841,7 @@ function zoomBind(){
     e.preventDefault();
     cancelPaneClicks();
     box.classList.add('panning');
-    box.setPointerCapture(e.pointerId);
+    capture(box, e);
     if(wantZoom){
       Object.assign(RZOOM, {on:true, y0:e.clientY, scale0:ZOOM.scale,
                             ax:e.clientX, ay:e.clientY});
@@ -869,6 +869,12 @@ function zoomBind(){
 
 let SPACE_DOWN = false;
 
+// Capture can throw for a pointer that is already gone -- a cancel that raced
+// the down, or a synthetic event from the test harness. Losing capture is
+// benign; an exception mid-handler is not.
+const capture = (el, e) => { try{ el.setPointerCapture(e.pointerId); }catch{} };
+
+
 /* ======================= mask editor =======================
 Painting happens at NATIVE VOXEL RESOLUTION on a canvas that CSS only scales up
 for display. Every stroke is converted to voxel indices before it touches
@@ -890,6 +896,7 @@ const ED = {
   subtract:false,          // whether the outline tools add or take away
   poly:[], polyDrag:-1, polyFresh:false, lastPoly:null,
   polyState:null,          // null | 'drawing' | 'editing' -- ITK-SNAP's states
+  polyHover:false,         // pointer is over the close target (first vertex)
   reverse:false,           // right-button drag: paint in reverse (erase)
   ruler:null,              // the ruler being dragged out right now
 };
@@ -929,7 +936,37 @@ slice-by-slice tracing fast, because a tumour barely changes between slices.
 Nothing touches the mask until Accept. The outline lives on its own canvas so
 cancelling is guaranteed to leave no trace.
 */
-function polyReset(){ ED.poly = []; ED.polyDrag = -1; ED.polyState = null; polyDraw(); }
+function polyReset(){ ED.poly = []; ED.polyDrag = -1; ED.polyState = null;
+                      ED.polyHover = false; polyDraw(); }
+
+/* Screen-pixel geometry for the freehand gesture, matching ITK-SNAP's
+   PolygonDrawingModel exactly: the close test is an inf-norm of 4 SCREEN
+   pixels around the first vertex (CheckNearFirstVertex), applied on click AND
+   on release -- so tracing right round the boundary and letting go where you
+   started closes the outline in one stroke. And a traced vertex lands every
+   8 screen pixels (DefaultFreehandFittingRate), which is what gives the curve
+   evenly spaced, draggable handles at any zoom. */
+const FREEHAND_RATE_PX = 8;
+const CLOSE_TOL_PX = 4;
+function voxelToScreen(v){
+  const cv = $('#axOvr'); if(!cv || !VOL.img) return null;
+  const r = cv.getBoundingClientRect();
+  return [r.left + (v[0]+0.5)/VOL.nx*r.width,
+          r.top  + (v[1]+0.5)/VOL.ny*r.height];
+}
+function nearFirstVertex(e){
+  if(!ED.poly || ED.poly.length <= 2) return false;
+  const s = voxelToScreen(ED.poly[0]); if(!s) return false;
+  // ITK-SNAP's vertices are continuous slice coordinates; ours are integer
+  // voxels, so mapping one back to the screen carries up to half a voxel of
+  // quantisation. The close tolerance is therefore ITK-SNAP's 4 screen pixels
+  // PLUS that half voxel -- identical where voxels are small on screen, and
+  // still correct when one voxel spans many pixels.
+  const cv = $('#axOvr'); const r = cv.getBoundingClientRect();
+  const halfVox = Math.max(r.width/VOL.nx, r.height/VOL.ny) / 2;
+  return Math.max(Math.abs(e.clientX-s[0]), Math.abs(e.clientY-s[1]))
+         < CLOSE_TOL_PX + halfVox;
+}
 function polyDraw(){ drawPaneOverlay('axial'); polyBarSync(); }
 
 function drawPoly(g){
@@ -956,25 +993,23 @@ function drawPoly(g){
     }
   } else {
     // While drawing, only the first vertex gets a handle: it is the close
-    // target. Click it (or press Enter) to close the outline.
-    g.beginPath(); g.arc(p[0][0]+.5, p[0][1]+.5, r*1.4, 0, 6.284);
-    g.fillStyle = '#fbbf24'; g.fill();
+    // target. Trace back to it and let go -- or click it -- and the outline
+    // closes. It grows when the pointer is over it, so "am I close enough"
+    // is never a guess.
+    g.beginPath(); g.arc(p[0][0]+.5, p[0][1]+.5, ED.polyHover ? r*2.2 : r*1.4, 0, 6.284);
+    g.fillStyle = ED.polyHover ? '#fde047' : '#fbbf24'; g.fill();
   }
 }
 
+/* The hint is STATIC per state, deliberately. A live point count sounds
+   helpful, but its changing width reflows the bar above the canvas, and the
+   canvas then shifts under the cursor mid-trace -- the stroke jumps. ITK-SNAP
+   has no such counter, and now neither do we. */
 function polyHint(){
   const hint = $('#polyHint'); if(!hint) return;
-  const p = ED.poly || [];
-  if(ED.polyState === 'editing'){
-    hint.textContent = `${p.length} points. Drag one to move it, shift-click to `
-      + `delete, click an edge to insert. Enter accepts.`;
-    return;
-  }
-  hint.textContent = !p.length
-    ? 'Click to add points, or press and drag to trace a curve. Mix both freely.'
-    : p.length < 3
-      ? `${p.length} point${p.length>1?'s':''} — at least 3 are needed.`
-      : `${p.length} points. Click the first point or press Enter to close.`;
+  hint.textContent = ED.polyState === 'editing'
+    ? 'Drag a point to move it, shift-click to delete, click an edge to insert. Enter accepts.'
+    : 'Trace round the boundary and let go back where you started — or click points. Enter closes.';
 }
 
 /* The polygon bar shows different actions in the two states, like the buttons
@@ -1033,7 +1068,7 @@ function polyFill(pts, value){
 function polyComplete(){
   if(!ED.poly || ED.poly.length < 3) return toast('Need at least 3 points', true);
   ED.polyState = 'editing';
-  ED.polyFresh = false; ED.polyDrag = -1;
+  ED.polyFresh = false; ED.polyDrag = -1; ED.polyHover = false;
   polyDraw();
 }
 
@@ -1355,7 +1390,7 @@ function bindPane(plane){
 
     // The ruler works with or without the editor -- measuring is not editing.
     if(tool === 'ruler' && plane === 'axial' && !rightPaint){
-      cv.setPointerCapture(e.pointerId);
+      capture(cv, e);
       ED.ruler = {a:[u,v], b:[u,v]};
       ED.painting = true; drawPaneOverlay('axial');
       return;
@@ -1368,7 +1403,7 @@ function bindPane(plane){
       cv._click = [e.clientX, e.clientY, plane, u, v];
       return;
     }
-    cv.setPointerCapture(e.pointerId);
+    capture(cv, e);
     const p = [u, v];
 
     if(ED.tool === 'polygon'){
@@ -1394,14 +1429,10 @@ function bindPane(plane){
           } else return;      // a click elsewhere does nothing to a closed outline
         }
       } else {
-        // Drawing: a click near the first point closes the outline; any other
-        // click appends a vertex, and dragging from it traces a curve.
-        const first = (ED.poly||[])[0];
-        if(first && ED.poly.length >= 3
-           && Math.abs(p[0]-first[0]) <= tol && Math.abs(p[1]-first[1]) <= tol){
-          polyComplete();
-          return;
-        }
+        // Drawing: a click on the close target (within 4 screen px of the
+        // first vertex, ITK-SNAP's CheckNearFirstVertex) closes the outline;
+        // any other click appends a vertex, and dragging from it traces.
+        if(nearFirstVertex(e)){ polyComplete(); return; }
         ED.poly.push(p); ED.polyDrag = ED.poly.length-1; ED.polyFresh = true;
         ED.polyState = 'drawing';
       }
@@ -1439,6 +1470,13 @@ function bindPane(plane){
   });
 
   cv.addEventListener('pointermove', e => {
+    // Hovering over the close target while drawing highlights it, the same
+    // feedback ITK-SNAP's m_HoverOverFirstVertex gives.
+    if(!ED.painting && editable() && ED.tool==='polygon' && ED.polyState==='drawing'){
+      const hov = nearFirstVertex(e);
+      if(hov !== ED.polyHover){ ED.polyHover = hov; drawPaneOverlay('axial'); }
+      return;
+    }
     if(!ED.painting) return;
     if(activeTool() === 'ruler'){
       if(ED.ruler){ ED.ruler.b = paneVoxel(plane, e); drawPaneOverlay('axial'); }
@@ -1450,9 +1488,17 @@ function bindPane(plane){
     if(ED.tool === 'polygon'){
       // Dragging straight after placing a point traces freehand from it;
       // dragging an existing point moves it.
-      if(ED.polyFresh && ED.polyDrag === ED.poly.length-1){
-        const last = ED.poly[ED.poly.length-1];
-        if(Math.abs(p[0]-last[0]) > 1 || Math.abs(p[1]-last[1]) > 1) ED.poly.push(p);
+      if(ED.polyFresh){
+        // A traced vertex lands every 8 screen pixels -- ITK-SNAP's freehand
+        // fitting rate -- so the handles come out evenly spaced at any zoom.
+        // polyDrag must follow the freshly traced tail: leaving it behind
+        // turned the rest of the trace into dragging one vertex around.
+        const s = voxelToScreen(ED.poly[ED.poly.length-1]);
+        const dx = e.clientX-s[0], dy = e.clientY-s[1];
+        if(dx*dx + dy*dy >= FREEHAND_RATE_PX*FREEHAND_RATE_PX){
+          ED.poly.push(p); ED.polyDrag = ED.poly.length-1;
+        }
+        ED.polyHover = nearFirstVertex(e);
       } else if(ED.polyDrag >= 0){
         ED.poly[ED.polyDrag] = p;
       }
@@ -1483,9 +1529,14 @@ function bindPane(plane){
       }
       drawPaneOverlay('axial');
     }
-    // Releasing a trace leaves the outline OPEN, in the drawing state -- the
-    // traced points are ordinary vertices now, and more clicks or drags extend
-    // them. Closing and accepting are explicit, exactly as in ITK-SNAP.
+    // ITK-SNAP's ProcessReleaseEvent, exactly: letting go back at the first
+    // vertex closes the outline -- so tracing right round the boundary is one
+    // stroke, ending where it began, and the shape is closed and editable.
+    // Released anywhere else, the outline stays open for more clicks or drags.
+    if(ED.tool==='polygon' && ED.polyState==='drawing' && ED.painting
+       && e && nearFirstVertex(e)){
+      polyComplete();
+    }
     ED.painting = false; ED.last = null; ED.reverse = false;
     ED.polyDrag = -1; ED.polyFresh = false;
   };
@@ -1562,6 +1613,10 @@ function bindEditorToolbar(){
   on('#tInterp', edInterpolate);
   POLYBAR_KEY = ED.polyState;      // the bar was just rendered for this state
   bindPolyBar();
+  // Fill the hint NOW, not on the first click. An empty hint that appears
+  // mid-gesture is a layout change, and a layout change moves the canvas
+  // under a stroke in progress.
+  polyHint();
   on('#tUndo',   () => edApplySnapshot(ED.undo, ED.redo));
   on('#tRedo',   () => edApplySnapshot(ED.redo, ED.undo));
   on('#tClear',  () => { edPushUndo(); sliceMask(SLICE).fill(0);
@@ -1639,7 +1694,7 @@ function toolbarHTML(){
   const brushy = isBrushy(ED.tool);
   return `
     <div id="edBar">
-      ${b('tPoly','P','◇ Polygon','polygon','P — click points or drag to trace; close, adjust, then Accept')}
+      ${b('tPoly','P','✎ Freehand','polygon','P or 3 — trace round the boundary and let go back where you started; adjust, then Accept. Clicks add single points too.')}
       ${b('tBrush','B','● Brush','brush','B — paint voxels; right-drag erases')}
       ${b('tErase','E','⌫ Erase','eraser','E')}
       ${b('tFill','G','◉ Fill','fill','G — fill an enclosed area, or remove a whole blob')}
@@ -1725,7 +1780,7 @@ function renderDetail(){
         series ${c.series} · ${c.size_xyz.join('×')}</span>
       <span class="spacer"></span>
       <span class="meta">${ED.on
-        ? `<kbd>3</kbd> polygon · <kbd>4</kbd> brush · <kbd>[</kbd><kbd>]</kbd> size ·
+        ? `<kbd>3</kbd> freehand · <kbd>4</kbd> brush · <kbd>[</kbd><kbd>]</kbd> size ·
            <kbd>⌘Z</kbd> undo · <kbd>⌘S</kbd> save · right-drag erase`
         : `<kbd>↑</kbd><kbd>↓</kbd> scans · <kbd>←</kbd><kbd>→</kbd> slices ·
            <kbd>Y</kbd> correct · <kbd>N</kbd> flag`}

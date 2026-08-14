@@ -137,12 +137,17 @@
        text-align:center;font-variant-numeric:tabular-nums}
 
   /* ---- mask editor ---- */
+  /* The bar must NEVER change height: it sits above the canvas, and a reflow
+     mid-trace moves the pixels under the cursor, so the stroke jumps. Fixed
+     row, no wrapping, hint truncates rather than growing a line. */
   #polyBar{display:flex;gap:6px;align-items:center;padding:7px 12px;
-       background:#1b2027;border-radius:9px;margin:-4px 0 10px}
+       background:#1b2027;border-radius:9px;margin:-4px 0 10px;
+       flex-wrap:nowrap;height:40px;box-sizing:border-box}
   #polyBar button{background:#252c35;border-color:#333c47;color:#e8ecf1;
-       padding:4px 10px;font-size:12.5px}
+       padding:4px 10px;font-size:12.5px;white-space:nowrap}
   #polyBar button:hover:not(:disabled){background:#2f3742}
-  #polyHint{color:#9aa4b1;font-size:11.5px}
+  #polyHint{color:#9aa4b1;font-size:11.5px;white-space:nowrap;
+       overflow:hidden;text-overflow:ellipsis;min-width:0}
   #edBar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:9px 12px;
        background:#111418;border-radius:9px;margin-bottom:10px}
   #edBar button{background:#1f242b;border-color:#2c333c;color:#e8ecf1;
@@ -423,7 +428,7 @@
   <dl>
     <dt><kbd>1</kbd></dt><dd>crosshair — click moves the cursor; right-drag zooms, middle-drag pans</dd>
     <dt><kbd>2</kbd></dt><dd>zoom/pan — left-drag pans, right-drag zooms</dd>
-    <dt><kbd>3</kbd> / <kbd>P</kbd></dt><dd>polygon — opens the editor if needed</dd>
+    <dt><kbd>3</kbd> / <kbd>P</kbd></dt><dd>freehand outline — opens the editor if needed</dd>
     <dt><kbd>4</kbd> / <kbd>B</kbd></dt><dd>paintbrush — opens the editor if needed</dd>
     <dt><kbd>5</kbd></dt><dd>the snake's job is done by the model here</dd>
     <dt><kbd>6</kbd> / <kbd>R</kbd></dt><dd>ruler — drag to measure in mm, works while reviewing too</dd>
@@ -467,15 +472,16 @@
     <dt>brush shapes</dt><dd>round, square, or adaptive — adaptive paints only
       what matches the intensity under the cursor</dd>
   </dl>
-  <h4>Editing — the polygon</h4>
+  <h4>Editing — the freehand outline</h4>
   <dl>
-    <dt>click</dt><dd>add a point</dd>
-    <dt>press and drag</dt><dd>trace a curve — mix clicks and curves freely</dd>
-    <dt>click the first point or <kbd>⏎</kbd></dt><dd>close the outline</dd>
+    <dt>trace round the boundary</dt><dd>let go back where you started — the
+      outline closes itself, exactly as in ITK-SNAP</dd>
+    <dt>click</dt><dd>add a single point; clicks and curves mix freely</dd>
+    <dt>click the first point or <kbd>⏎</kbd></dt><dd>also closes it</dd>
     <dt>then: drag a point</dt><dd>move it</dd>
     <dt>shift-click a point</dt><dd>delete it</dd>
     <dt>click an edge</dt><dd>insert a point there</dd>
-    <dt><kbd>⏎</kbd> again</dt><dd>accept and fill</dd>
+    <dt><kbd>⏎</kbd></dt><dd>accept and fill</dd>
     <dt><kbd>V</kbd></dt><dd>paste the last accepted outline onto this slice</dd>
     <dt><kbd>⌫</kbd></dt><dd>remove the last point (while drawing)</dd>
     <dt><kbd>esc</kbd></dt><dd>discard the outline</dd>
