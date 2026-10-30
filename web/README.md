@@ -422,7 +422,7 @@ end, including the parts node cannot run — IndexedDB, canvas, the real
 .venv/bin/python web/test/run_selftest.py --serve    # open it in any browser
 ```
 
-43 checks, from gzip to zip export. It builds its own DICOM files
+48 checks, from gzip to zip export. It builds its own DICOM files
 (`test/fixture.js`) so it involves no lab data and is safe to run anywhere —
 including with `--serve` on the machine of anyone who wants to know whether
 their browser is supported.

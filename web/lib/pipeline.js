@@ -35,7 +35,7 @@
  * hashing every re-imported mask would look edited whether or not it was.
  */
 
-import { assertSameGrid, findT2AxialSeries, loadSeries } from './volume.js';
+import { assertSameGrid, findT1AxialSeries, findT2AxialSeries, loadSeries } from './volume.js';
 import { writeNiftiGz, readNifti } from './nifti.js';
 import { reviewScore, removeSmallComponents } from './predictor.js';
 import { countComponents, maskFacts } from './label.js';
@@ -77,8 +77,48 @@ export const fileNames = (name) => {
     mask: `${s}_tumor.nii.gz`,
     qc: `${s}_qc.png`,
     workspace: `${s}.itksnap`,
+    // Only present for sessions that were acquired with one. Everything that
+    // walks these names skips a kind with no stored bytes, so a case without a
+    // T1 simply exports one file fewer.
+    t1: `${s}_T1ax.nii.gz`,
   };
 };
+
+/**
+ * The T1 axial companion for a scan folder, ready to store -- or null.
+ *
+ * DELIBERATELY SEPARATE FROM EVERYTHING THAT PRODUCES A NUMBER. The T1 is
+ * never segmented, never resampled onto the T2 grid, and never touches a mask
+ * or a volume. It is a second image the lab reads next to the T2, and the two
+ * are lined up at display time through their own physical coordinates -- they
+ * are different acquisitions on different grids (15 slices at 1.20 mm against
+ * 18 at 1.10 mm in this study), so any attempt to share a grid between them
+ * would be wrong.
+ *
+ * @returns {Promise<null | {bytes, series, sequence, size_xyz, spacing, n_slices}>}
+ */
+async function loadT1(entries) {
+  const series = await findT1AxialSeries(entries);
+  if (!series.length) return null;
+  // Same rule as the T2: the highest series number is the last acquisition,
+  // which is the redo when there was one.
+  const chosen = series[series.length - 1];
+  const { volume: vol, meta } = await loadSeries(chosen.files);
+  return {
+    bytes: await writeNiftiGz(vol),
+    series: chosen.seriesLabel,
+    sequence: meta.sequenceName,
+    size_xyz: [vol.nx, vol.ny, vol.nz],
+    spacing: vol.spacing.map((x) => round(x, 5)),
+    n_slices: vol.nz,
+  };
+}
+
+/** What goes on the case record to say a T1 is stored (or is not). */
+const t1Record = (t1) => (t1 ? {
+  series: t1.series, sequence: t1.sequence,
+  size_xyz: t1.size_xyz, spacing: t1.spacing, n_slices: t1.n_slices,
+} : null);
 
 /**
  * A minimal ITK-SNAP workspace, so a case opens with one double-click.
@@ -168,10 +208,23 @@ export async function processSession(name, entries, predictor, opts = {}) {
     workspace: itksnapWorkspace(names.image, names.mask),
   });
 
+  // Best effort, and last: a T1 that fails to load must not cost the session
+  // its mask. Reasons this legitimately comes back null include the session
+  // never having been acquired with a T1 at all, which is common.
+  let t1 = null;
+  try {
+    t1 = await loadT1(entries);
+    if (t1) await store.putFile(name, 't1', t1.bytes);
+  } catch (e) {
+    t1 = null;
+    console.warn(`${name}: T1 not loaded -- ${e.message}`);
+  }
+
   const record = {
     case: name,
     source: name,
     series: chosen.seriesLabel,
+    t1: t1Record(t1),
     mouse_from_dicom: meta.patientName,
     study_date: meta.studyDate,
     size_xyz: [vol.nx, vol.ny, vol.nz],
@@ -368,4 +421,24 @@ export function volumesCsv(records) {
 
 export function resultsJson(records) {
   return JSON.stringify({ written_at: nowISO(), cases: records }, null, 2);
+}
+
+/**
+ * Attach a T1 to a case that was segmented before T1s were captured -- or
+ * before its folder had one.
+ *
+ * The scan folder is picked again for this, because the DICOM never stays in
+ * storage: only the converted T2 does. Nothing else about the case changes,
+ * and in particular no mask, volume or hash is touched.
+ *
+ * @returns {Promise<object|null>} the updated record, or null if the folder
+ *          holds no T1 axial series.
+ */
+export async function attachT1(record, entries) {
+  const t1 = await loadT1(entries);
+  if (!t1) return null;
+  await store.putFile(record.case, 't1', t1.bytes);
+  record.t1 = t1Record(t1);
+  await store.putCase(record);
+  return record;
 }

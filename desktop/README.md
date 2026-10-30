@@ -65,7 +65,7 @@ unset it.
 
 ```sh
 npm run smoke        # serving contract: isolation, crypto, model loads
-npm run selftest     # the web build's own 43-check suite, inside the shell
+npm run selftest     # the web build's own 48-check suite, inside the shell
 ```
 
 There is also an end-to-end mode that answers the two native dialogs from the
@@ -97,10 +97,40 @@ node ../web/test/parity.mjs --sweep 20
 npm run dist         # -> dist/<product>-<version>-arm64.dmg
 ```
 
-The dmg is unsigned. First launch on another Mac therefore needs
-**right-click → Open** once (or System Settings → Privacy & Security →
-"Open Anyway"); after that it opens normally. Signing/notarization is a
-deliberate later step.
+**The app is ad-hoc signed (`"identity": "-"`), and that is load-bearing.**
+`"identity": null` — what this used to say — does not mean "unsigned but
+fine": it skips signing altogether and leaves only the linker's stub
+signature, with no seal over the bundle (`codesign --verify` fails with
+*"code has no resources but signature indicates they must be present"*). That
+costs nothing on the machine that built it, because those files never carry
+`com.apple.quarantine`. Send the dmg to anyone — AirDrop, USB, download —
+and the copy does carry it, Gatekeeper validates the signature, the
+validation fails, and macOS reports the app as **"damaged and cannot be
+opened"**. It is not damaged, and no amount of re-sending fixes it. Ad-hoc
+signing seals the whole bundle so it validates. (arm64 is stricter than
+Intel here: every arm64 binary must carry at least an ad-hoc signature to
+run at all.)
+
+It is still **not notarized**, so a first launch on another Mac needs
+System Settings → Privacy & Security → **"Open Anyway"** (on macOS 15+ the
+old right-click → Open shortcut no longer covers this), or, to skip the
+dialog entirely:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/MRI Review.app"
+```
+
+Notarization needs a $99/yr Apple Developer ID and is the only way to make it
+open on a double-click with nothing else asked; still a deliberate later step.
+
+After `npm run dist`, check the signature before sending it anywhere:
+
+```sh
+codesign --verify --deep --strict "dist/mac-arm64/MRI Review.app" && echo OK
+```
+
+Silence plus `OK` is what a distributable build looks like. Any message here
+means every recipient will be told the app is damaged.
 
 The build packs `../web` into the app's resources **including `web/model/`
 if present** — check it is (89 MB + 67 MB), or the app falls back to the

@@ -14,7 +14,9 @@
  * storage and on OffscreenCanvas.
  */
 
-import { findT2AxialSeries, loadSeries, groupSessions, assertSameGrid } from '../lib/volume.js';
+import {
+  findT1AxialSeries, findT2AxialSeries, loadSeries, groupSessions, assertSameGrid,
+} from '../lib/volume.js';
 import { writeNifti, writeNiftiGz, readNifti } from '../lib/nifti.js';
 import { gzip, gunzip, zip, crc32 } from '../lib/gz.js';
 import { signedDistance } from '../lib/edt.js';
@@ -584,6 +586,89 @@ export async function run() {
     const cut = full.subarray(0, Math.floor(full.length * 0.6));
     const broken = [{ file: new File([cut], 'x.dcm'), path: '9004/DICOM/40004/1/x.dcm' }];
     await throws(() => loadSeries(broken), 'truncated', 'a truncated file');
+  });
+
+  // -------------------------------------------------------------------------
+  // The T1 companion
+  // -------------------------------------------------------------------------
+  // The T1 is shown next to the T2 and never segmented, so what has to be right
+  // is narrow but unforgiving: the correct series is picked out of a folder
+  // where three of them share a SeriesDescription, and it arrives carrying its
+  // OWN physical placement -- which is the only thing that can line two
+  // different acquisitions up. The fixture gives it a deliberately different
+  // grid (5 slices at 1.20 mm against the T2's 6 at 1.10) so anything that
+  // quietly assumed a shared grid fails here.
+
+  const T1SESSION = '9005 TESTT1 Male d12';
+  const T1GEOM = { nz: 5, spacingBetweenSlices: 1.20, zTop: -1.60,
+                   rows: 60, columns: 58, pixelSpacing: [0.1563, 0.1587] };
+  const t1Entries = [
+    ...makeSession(T1SESSION),                        // T2 coronal + T2 axial
+    ...makeSession(T1SESSION, {                       // and a T1, on its own grid
+      series: [{ number: 40006, sequenceName: 'T1w FSE (axial,n' }],
+      geometry: T1GEOM,
+    }),
+  ];
+
+  await check('the T1 axial series is picked out by SequenceName alone', async () => {
+    const t1 = await findT1AxialSeries(t1Entries);
+    eq(t1.length, 1, 'T1 axial series found');
+    eq(t1[0].seriesLabel, '40006', 'series number');
+    // And the T2 discovery must not have started claiming it.
+    const t2 = await findT2AxialSeries(t1Entries);
+    eq(t2.length, 1, 'T2 axial series still found');
+    eq(t2[0].seriesLabel, '40004', 'T2 series number');
+  });
+
+  await check('a T1 is stored beside the scan, on its own grid', async () => {
+    const rec = await pipeline.processSession(T1SESSION, t1Entries,
+                                              getPredictor('stub:sphere'), {});
+    truthy(rec.t1, 'the record says a T1 is stored');
+    eq(rec.t1.series, '40006', 'T1 series');
+    eq(rec.t1.n_slices, T1GEOM.nz, 'T1 slice count');
+    close(rec.t1.spacing[2], T1GEOM.spacingBetweenSlices, 1e-9, 'T1 slice spacing');
+    truthy(await store.getFile(T1SESSION, 't1'), 'the T1 image is in storage');
+    // The whole point: it is NOT the T2's grid. If these ever match, the
+    // fixture stopped testing what it is here to test.
+    eq(rec.size_xyz[2], GEOMETRY.nz, 'the T2 keeps its own slice count');
+    truthy(rec.t1.n_slices !== rec.size_xyz[2], 'T1 and T2 grids differ');
+  });
+
+  await check('the T1 comes back with the placement needed to line it up', async () => {
+    await Backend.reload();
+    const t1 = await Backend.t1Raw(T1SESSION);
+    truthy(t1, 't1Raw returned an image');
+    eq(t1.meta.nz, T1GEOM.nz, 'slice count');
+    eq(t1.data.length, t1.meta.nx * t1.meta.ny * t1.meta.nz, 'voxel count');
+    eq(t1.meta.direction.length, 9, 'direction');
+    // Origin is the LOWEST-z slice, as everywhere else in this codebase.
+    close(t1.meta.origin[2],
+          T1GEOM.zTop - (T1GEOM.nz - 1) * T1GEOM.spacingBetweenSlices, 1e-6,
+          'T1 origin z');
+    // And the T2 carries its own, or there is nothing to map from.
+    const t2 = await Backend.volumeRaw(T1SESSION);
+    eq(t2.meta.origin.length, 3, 'T2 origin');
+    eq(t2.meta.direction.length, 9, 'T2 direction');
+    truthy(Math.abs(t2.meta.origin[2] - t1.meta.origin[2]) > 1e-6,
+           'the two stacks start at different heights, as real ones do');
+  });
+
+  await check('a session with no T1 stores none, and that is not an error', async () => {
+    const rec = (await store.allCases()).find((c) => c.case === SESSION);
+    eq(rec.t1, null, 'no T1 on the record');
+    eq(await store.getFile(SESSION, 't1'), undefined, 'no T1 in storage');
+    eq(await Backend.t1Raw(SESSION), null, 't1Raw says so plainly');
+  });
+
+  await check('deleting a case takes its T1 with it', async () => {
+    // A file kind that deleteCase does not know about is a blob nothing can
+    // ever reach again -- invisible, and permanent. This also puts the suite
+    // back to the two cases everything below it expects.
+    await store.deleteCase(T1SESSION);
+    eq(await store.getFile(T1SESSION, 't1'), undefined, 'the T1 file is gone');
+    eq(await store.getFile(T1SESSION, 'image'), undefined, 'the scan is gone');
+    await Backend.reload();
+    eq(Backend.STATE.cases.length, 2, 'two cases again');
   });
 
   // -------------------------------------------------------------------------

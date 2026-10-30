@@ -114,16 +114,17 @@ const baseOf = (p) => p.slice(p.lastIndexOf('/') + 1);
 const HEADER_PREFIX_BYTES = 16384;   // SequenceName sits far inside this
 
 /**
- * Group files into series and keep only the T2 axial ones.
+ * Group files into series and keep the ones a classifier accepts.
  *
  * @param {Array<{file: File|Blob, path: string}>} entries
+ * @param {(meta) => boolean} accept  run on ONE header per series
  * @returns {Promise<Array<{seriesDir, seriesNumber, files, meta}>>} ordered by
  *          series number, which ascends with acquisition time -- so the LAST
  *          entry is the most recent acquisition, which is the redo when there
  *          was one. `src/loader.py` orders these the same way and
  *          `process_session` takes the last for the same reason.
  */
-export async function findT2AxialSeries(entries) {
+export async function findSeries(entries, accept) {
   const bySeries = new Map();
   for (const e of entries) {
     if (!e.path.toLowerCase().endsWith('.dcm')) continue;
@@ -144,7 +145,7 @@ export async function findT2AxialSeries(entries) {
     } catch {
       continue;                    // unreadable series does not stop the walk
     }
-    if (!dicom.isT2Axial(m)) continue;
+    if (!accept(m)) continue;
 
     // The series number is the folder ABOVE the leaf: DICOM/40004/1/*.dcm.
     // Falling back to the leaf name keeps flatter layouts working.
@@ -161,6 +162,16 @@ export async function findT2AxialSeries(entries) {
   out.sort((a, b) => a.seriesNumber - b.seriesNumber);
   return out;
 }
+
+export const findT2AxialSeries = (entries) => findSeries(entries, dicom.isT2Axial);
+
+/**
+ * The T1 axial series in a scan folder, ordered the same way.
+ *
+ * Many sessions have none -- the lab did not acquire one every time -- and
+ * that is not an error anywhere: the caller simply has no T1 to show.
+ */
+export const findT1AxialSeries = (entries) => findSeries(entries, dicom.isT1Axial);
 
 /**
  * Every scan folder in a set of dropped files.

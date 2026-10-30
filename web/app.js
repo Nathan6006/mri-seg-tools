@@ -22,6 +22,7 @@
  */
 import * as Backend from './lib/backend.js';
 import { fileNames } from './lib/pipeline.js';
+import { mountAccountUI } from './lib/account.js';
 
 const $ = s => document.querySelector(s);
 let STATE=null, SEL=null, SLICE=0, OVERLAY=true;
@@ -32,7 +33,7 @@ let FILTER='all', SORT='priority', QUERY='';
    that gets stored -- these are display and workflow settings only. */
 const PREFS = Object.assign({
   opacity:55, radius:6, autoNext:false, threeUp:true, crosshair:true,
-  brushShape:'round', brush3d:false, adaptTol:8,
+  brushShape:'round', brush3d:false, adaptTol:8, eraseMode:'brush',
 }, JSON.parse(localStorage.getItem('mriseg.prefs') || '{}'));
 const savePrefs = () => localStorage.setItem('mriseg.prefs', JSON.stringify(PREFS));
 
@@ -282,10 +283,19 @@ async function refresh(){
 
   const s = STATE.storage;
   const pol = s.policy || {};
+  // The readout has to say WHERE, not just how much. On the shared backend
+  // "stored in this browser" would be flatly untrue, and the byte count is
+  // unavailable there (and would be misleading if filled in from the
+  // browser's own quota, which that backend is not using).
+  const cloud = Backend.storageMode_() === Backend.STORAGE_CLOUD;
   $('#outDirLabel').innerHTML = STATE.cases.length
-    ? `Stored in this browser: ${humanBytes(s.used)} used · kept `
-      + `<strong>${pol.lifetime || 'until cleared'}</strong>`
-    : 'Nothing stored in this browser yet';
+    ? (cloud
+        ? `Shared workspace: ${STATE.cases.length} scan(s) · kept `
+          + `<strong>${pol.lifetime || 'on the server'}</strong>`
+        : `Stored in this browser: ${humanBytes(s.used)} used · kept `
+          + `<strong>${pol.lifetime || 'until cleared'}</strong>`)
+    : (cloud ? 'This workspace has no scans yet'
+             : 'Nothing stored in this browser yet');
   // How long results survive is a per-browser policy, and the answers differ by
   // a lot -- indefinitely on Chrome with persistence, seven days on Safari
   // whatever you do. Someone three hours into reviewing a cohort should hear
@@ -382,6 +392,7 @@ function select(name){
   SEL=name; SLICE=0;
   ZOOM.scale=1; ZOOM.x=0; ZOOM.y=0;   // a new scan starts at fit-to-window
   RULERS.clear();   // measurements belong to the scan they were drawn on
+  t1CaseChanged();
   renderList(); renderDetail();
   const el=$('.caseitem.sel'); if(el) el.scrollIntoView({block:'nearest'});
 }
@@ -435,16 +446,23 @@ function invalidateMask(){ VOL.mask = null; }
    256-bin histogram that comes with the volume rather than by sorting 1.1M
    voxels. */
 function autoWindow(){
-  const h = VOL.hist;
-  if(!h || !h.length){ WL.lo = 0; WL.hi = 65535; return; }
-  const total = h.reduce((a,b)=>a+b, 0);
+  [WL.lo, WL.hi] = windowFromHist(VOL.hist);
+}
+
+/* The window itself: 1st to 99.5th percentile of a 256-bin histogram. Shared
+   with the T1 pane, which needs its own window from its own histogram -- the
+   T2's would be meaningless on a different sequence. */
+function windowFromHist(hist){
+  if(!hist || !hist.length) return [0, 65535];
+  const total = hist.reduce((a,b)=>a+b, 0);
   const at = frac => {
     let acc = 0;
-    for(let i=0;i<h.length;i++){ acc += h[i];
-      if(acc >= total*frac) return (i+0.5)/h.length*65535; }
+    for(let i=0;i<hist.length;i++){ acc += hist[i];
+      if(acc >= total*frac) return (i+0.5)/hist.length*65535; }
     return 65535;
   };
-  WL.lo = at(0.01); WL.hi = Math.max(at(0.995), WL.lo + 1);
+  const lo = at(0.01);
+  return [lo, Math.max(at(0.995), lo + 1)];
 }
 
 const wlWidth  = () => WL.hi - WL.lo;
@@ -563,6 +581,7 @@ function drawPaneOverlay(plane){
 function renderAllPanes(){
   renderPane('axial');
   if(PREFS.threeUp){ renderPane('coronal'); renderPane('sagittal'); }
+  renderT1();          // follows the cursor; a no-op when the pane is closed
   updatePaneLabels();
   edStats();
 }
@@ -875,6 +894,301 @@ let SPACE_DOWN = false;
 const capture = (el, e) => { try{ el.setPointerCapture(e.pointerId); }catch{} };
 
 
+/* ======================= the T1 companion =======================
+A second image, shown next to the T2, scrolling with it.
+
+WHY THIS IS NOT AN OVERLAY, AND NOT ON THE T2's GRID
+----------------------------------------------------
+The T1 axial is a SEPARATE ACQUISITION: 15 slices at 1.20 mm against the T2's
+18 at 1.10 mm, and a different in-plane spacing too. Nothing about it lines up
+by index. So it is drawn in its own pane, on its own grid, and the two are tied
+together the only way that is actually true -- through physical coordinates.
+The T2 cursor is converted to millimetres (LPS, the coordinates DICOM gave us)
+and back into T1 voxels, so the T1 pane always shows the slice through the same
+point in the mouse, and its crosshair sits on the same anatomy.
+
+It is display only, and deliberately so. The T1 is never segmented, never
+resampled, never written into a mask, and never contributes to a volume -- the
+whole correction-tracking story depends on exactly one image having a mask.
+*/
+const T1 = {
+  on:false,                 // whether the pane is wanted
+  name:null, img:null,
+  nx:0, ny:0, nz:0, sx:1, sy:1, sz:1,
+  origin:[0,0,0], direction:[1,0,0, 0,1,0, 0,0,1],
+  vmin:0, vmax:1, hist:null, series:null, sequence:null,
+  lo:0, hi:65535,           // its own display window; the T2's would be wrong
+  Minv:null,                // world -> voxel for this grid
+  u:0, v:0, k:0, inside:false,   // where the T2 cursor lands here
+};
+
+/* index -> world is `origin + direction * diag(spacing) * index`, which is
+   ITK's own convention and the one the DICOM headers were read into. */
+function gridMatrix(direction, spacing){
+  const M = new Array(9);
+  for(let i=0;i<3;i++) for(let j=0;j<3;j++) M[i*3+j] = direction[i*3+j]*spacing[j];
+  return M;
+}
+
+function invert3(m){
+  const [a,b,c,d,e,f,g,h,i] = m;
+  const det = a*(e*i-f*h) - b*(d*i-f*g) + c*(d*h-e*g);
+  if(Math.abs(det) < 1e-12) return null;        // a degenerate grid: give up
+  return [ (e*i-f*h)/det, (c*h-b*i)/det, (b*f-c*e)/det,
+           (f*g-d*i)/det, (a*i-c*g)/det, (c*d-a*f)/det,
+           (d*h-e*g)/det, (b*g-a*h)/det, (a*e-b*d)/det ];
+}
+
+const mul3 = (m, v) => [
+  m[0]*v[0]+m[1]*v[1]+m[2]*v[2],
+  m[3]*v[0]+m[4]*v[1]+m[5]*v[2],
+  m[6]*v[0]+m[7]*v[1]+m[8]*v[2],
+];
+
+/** A T2 voxel in millimetres. */
+function worldFromT2(x, y, z){
+  const M = gridMatrix(VOL.direction || [1,0,0,0,1,0,0,0,1], [VOL.sx, VOL.sy, VOL.sz]);
+  const o = VOL.origin || [0,0,0];
+  const w = mul3(M, [x, y, z]);
+  return [w[0]+o[0], w[1]+o[1], w[2]+o[2]];
+}
+
+/** Millimetres back to a T2 voxel, rounded. */
+function t2FromWorld(w){
+  const M = gridMatrix(VOL.direction || [1,0,0,0,1,0,0,0,1], [VOL.sx, VOL.sy, VOL.sz]);
+  const Minv = invert3(M);
+  if(!Minv) return null;
+  const o = VOL.origin || [0,0,0];
+  const p = mul3(Minv, [w[0]-o[0], w[1]-o[1], w[2]-o[2]]);
+  return p.map(Math.round);
+}
+
+/** Where the T2 cursor falls in the T1, recomputed on every render. */
+function t1Sync(){
+  if(!T1.img || !T1.Minv || !VOL.img) return;
+  const w = worldFromT2(CUR.x, CUR.y, SLICE);
+  const p = mul3(T1.Minv, [w[0]-T1.origin[0], w[1]-T1.origin[1], w[2]-T1.origin[2]]);
+  const u = Math.round(p[0]), v = Math.round(p[1]), k = Math.round(p[2]);
+  T1.inside = u>=0 && v>=0 && k>=0 && u<T1.nx && v<T1.ny && k<T1.nz;
+  T1.u = Math.max(0, Math.min(T1.nx-1, u));
+  T1.v = Math.max(0, Math.min(T1.ny-1, v));
+  // The T1 covers less of the mouse than the T2 here (15 slices against 18),
+  // so the ends of the T2 stack genuinely have no T1 slice. Clamping to the
+  // nearest one and SAYING SO in the label beats a black pane.
+  T1.k = Math.max(0, Math.min(T1.nz-1, k));
+}
+
+function t1PaneHTML(){
+  return `<div class="pane" id="paneT1"
+       style="aspect-ratio:${T1.nx*T1.sx}/${T1.ny*T1.sy}">
+      <div class="pinner">
+        <canvas class="px" id="t1Img"></canvas><canvas id="t1Ovr"></canvas>
+      </div>
+      <div class="plab" id="t1Lab"></div>
+    </div>`;
+}
+
+const t1Showing = () => T1.on && T1.img && T1.name === SEL;
+
+function renderT1(){
+  if(!t1Showing()) return;
+  const img = $('#t1Img'), ovr = $('#t1Ovr');
+  if(!img || !ovr) return;
+  t1Sync();
+  const w = T1.nx, h = T1.ny;
+  if(img.width !== w || img.height !== h){
+    img.width = ovr.width = w; img.height = ovr.height = h;
+  }
+  const g = img.getContext('2d');
+  const d = g.createImageData(w, h);
+  const a = d.data, V = T1.img;
+  const lo = T1.lo, span = Math.max(T1.hi - T1.lo, 1), off = T1.k*w*h;
+  for(let i=0;i<w*h;i++){
+    let s = (V[off+i] - lo)/span*255;
+    s = s < 0 ? 0 : s > 255 ? 255 : s;
+    const o = i<<2;
+    a[o] = a[o+1] = a[o+2] = s; a[o+3] = 255;
+  }
+  g.putImageData(d, 0, 0);
+
+  const go = ovr.getContext('2d');
+  go.clearRect(0, 0, w, h);
+  if(PREFS.crosshair !== false){
+    go.strokeStyle = T1.inside ? 'rgba(80,220,255,.75)' : 'rgba(180,180,180,.45)';
+    go.lineWidth = 0.8;
+    const gap = Math.max(3, Math.round(Math.min(w,h)*0.03));
+    const cx = T1.u, cy = T1.v;
+    go.beginPath();
+    go.moveTo(0, cy+.5); go.lineTo(Math.max(0,cx-gap), cy+.5);
+    go.moveTo(Math.min(w,cx+gap), cy+.5); go.lineTo(w, cy+.5);
+    go.moveTo(cx+.5, 0); go.lineTo(cx+.5, Math.max(0,cy-gap));
+    go.moveTo(cx+.5, Math.min(h,cy+gap)); go.lineTo(cx+.5, h);
+    go.stroke();
+  }
+  const lab = $('#t1Lab');
+  if(lab) lab.textContent = `T1 · slice ${T1.k+1} / ${T1.nz}`
+    + (T1.inside ? '' : ' · nearest — this point is outside the T1');
+}
+
+/** The T1 pane navigates like the others: click moves the cursor, scroll scrolls. */
+function bindT1Pane(){
+  const cv = $('#t1Ovr');
+  if(!cv || cv._bound) return;
+  cv._bound = true;
+  cv.addEventListener('pointerdown', e => {
+    if(e.button !== 0 || !T1.Minv) return;
+    const r = cv.getBoundingClientRect();
+    const u = Math.floor((e.clientX-r.left)/r.width * T1.nx);
+    const v = Math.floor((e.clientY-r.top) /r.height * T1.ny);
+    // Straight back the other way: this T1 voxel in millimetres, then the T2
+    // voxel that contains it.
+    const M = gridMatrix(T1.direction, [T1.sx, T1.sy, T1.sz]);
+    const p = mul3(M, [u, v, T1.k]);
+    const t2 = t2FromWorld([p[0]+T1.origin[0], p[1]+T1.origin[1], p[2]+T1.origin[2]]);
+    if(!t2) return;
+    CUR.x = Math.max(0, Math.min(VOL.nx-1, t2[0]));
+    CUR.y = Math.max(0, Math.min(VOL.ny-1, t2[1]));
+    const z = Math.max(0, Math.min(VOL.nz-1, t2[2]));
+    if(z !== SLICE && window._setSlice) window._setSlice(z);
+    else renderAllPanes();
+  });
+  cv.addEventListener('wheel', e => {
+    e.preventDefault();
+    if(!window._setSlice) return;
+    window._setSlice(SLICE + (e.deltaY > 0 ? 1 : -1));   // both panes move
+  }, {passive:false});
+}
+
+/**
+ * Load the stored T1 for a case.
+ * @returns {'ok'|'none'|'error'}
+ */
+async function t1Load(name){
+  try{
+    const r = await Backend.t1Raw(name);
+    if(!r) return 'none';
+    Object.assign(T1, r.meta, {img:r.data, name});
+    T1.Minv = invert3(gridMatrix(T1.direction, [T1.sx, T1.sy, T1.sz]));
+    if(!T1.Minv){
+      toast('That T1 has a degenerate grid and cannot be lined up', true);
+      return 'error';
+    }
+    [T1.lo, T1.hi] = windowFromHist(T1.hist);
+    return 'ok';
+  }catch(e){ toast(e.message, true); return 'error'; }
+}
+
+/* The files of ONE session out of a selection, so picking a parent folder full
+   of scans does not hand us another mouse's T1. */
+function entriesForCase(entries, name){
+  const groups = new Map();
+  for(const it of entries){
+    const k = sessionKey(it.path);
+    if(!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(it);
+  }
+  if(groups.size === 1) return [...groups.values()][0];
+  for(const [k, v] of groups) if(k.split('/').pop() === name) return v;
+  return null;
+}
+
+/* Cases segmented before T1s were captured have none stored, and the DICOM
+   itself is never kept -- only the converted T2 is. So the scan folder is
+   picked once more, the T1 read out of it, and stored from then on. */
+async function t1Import(name){
+  let entries;
+  try{
+    if(window.desktopBridge){
+      const picks = await window.desktopBridge.pickScanFolders();
+      if(!picks.length) return false;
+      const { entriesFromPicks } = await import('./lib/desktop.js');
+      entries = entriesFromPicks(picks, window.desktopBridge);
+    } else {
+      entries = await pickFolderEntries();
+      if(!entries) return false;
+    }
+  }catch(e){ toast(e.message, true); return false; }
+
+  const mine = entriesForCase(entries, name);
+  if(!mine){
+    toast(`That selection holds several scans and none of them is "${name}". `
+      + `Pick that scan's own folder.`, true);
+    return false;
+  }
+  const busy = toast('Reading the T1…');
+  try{
+    const rec = await Backend.loadT1From(name, mine);
+    busy.remove();
+    if(!rec){
+      toast('No T1 axial series in that folder — this session was acquired '
+        + 'without one.', true);
+      return false;
+    }
+    await refresh();
+    toast(`T1 loaded — series ${rec.t1.series}, ${rec.t1.n_slices} slices`);
+    return true;
+  }catch(e){ busy.remove(); toast(e.message, true); return false; }
+}
+
+/** A folder of DICOM from the browser's own picker, as pipeline entries. */
+function pickFolderEntries(){
+  return new Promise(resolve => {
+    const inp = $('#t1picker');
+    if(!inp) return resolve(null);
+    inp.value = '';
+    const settle = () => {
+      inp.onchange = inp.oncancel = null;
+      const files = [...inp.files];
+      resolve(files.length
+        ? files.map(f => ({file:f, path:f.webkitRelativePath || f.name}))
+        : null);
+    };
+    inp.onchange = settle;
+    inp.oncancel = settle;      // dismissing the dialog must not hang the caller
+    inp.click();
+  });
+}
+
+/* ⇧⌘G, and the T1 button: show the companion image, load it if need be, and
+   hide it again on a second press. */
+let T1_LAST_TOGGLE = -1e9;
+async function toggleT1(){
+  // On macOS a menu key equivalent never reaches the page, so ⇧⌘G arrives
+  // once -- through the menu in the shell, through this handler in a browser.
+  // Not every platform is that strict, and a toggle that fired twice would
+  // open the pane and shut it again in the same breath.
+  const now = performance.now();
+  if(now - T1_LAST_TOGGLE < 250) return;
+  T1_LAST_TOGGLE = now;
+  if(!SEL) return toast('Open a scan first');
+  if(t1Showing()){ T1.on = false; renderDetail(); return; }
+  let r = await t1Load(SEL);
+  if(r === 'none'){
+    if(!confirm(`No T1 is stored for "${SEL}".\n\nChoose that scan's folder to `
+      + `read one from it? Sessions acquired without a T1 have none.`)) return;
+    if(!await t1Import(SEL)) return;
+    r = await t1Load(SEL);
+  }
+  if(r !== 'ok') return;
+  T1.on = true;
+  renderDetail();
+}
+
+/* Moving to another scan keeps the pane open but must not show the previous
+   mouse's T1 for even one frame. */
+function t1CaseChanged(){
+  T1.img = null; T1.name = null;
+  if(!T1.on) return;
+  t1Load(SEL).then(r => {
+    if(r === 'ok') renderDetail();
+    else {
+      T1.on = false;
+      if(r === 'none') toast('No T1 stored for this scan — the pane is closed');
+      renderDetail();
+    }
+  });
+}
+
 /* ======================= mask editor =======================
 Painting happens at NATIVE VOXEL RESOLUTION on a canvas that CSS only scales up
 for display. Every stroke is converted to voxel indices before it touches
@@ -892,6 +1206,7 @@ const ED = {
   undo:[], redo:[],
   tool:'polygon', radius:6, painting:false, last:null,
   shape:'round',           // brush shape: round | square | adaptive
+  eraseMode:'brush',       // the eraser: a brush, or an outlined area
   brush3d:false, adaptTol:8,
   subtract:false,          // whether the outline tools add or take away
   poly:[], polyDrag:-1, polyFresh:false, lastPoly:null,
@@ -903,9 +1218,26 @@ const ED = {
 
 const countOn = m => { let n=0; for(let i=0;i<m.length;i++) if(m[i]) n++; return n; };
 
+/* The eraser has two shapes, exactly as ITK-SNAP's does: a brush that takes
+   voxels away as it is dragged, and an OUTLINED AREA -- trace a region, press
+   Enter, and everything inside it goes. The area eraser is the polygon tool
+   with the fill value forced to zero, which is what ITK-SNAP does too; making
+   it a mode of the eraser rather than a fourth tool is what stops the toolbar
+   from growing a near-duplicate of the outline tool. */
+const eraseArea = () => ED.tool === 'eraser' && ED.eraseMode === 'area';
+
+// Which tool draws an outline: the polygon, and the eraser when it is set to
+// take an area rather than brush one away.
+const outlining = t => t === 'polygon' || (t === 'eraser' && ED.eraseMode === 'area');
+
+// Whether an outline, once accepted, adds or takes away. The area eraser
+// always takes away -- that is the whole point of it.
+const outlineSubtract = () => eraseArea() || ED.subtract;
+
 // The brush-like tools: the ones the brush panel (shape, 3D, size) applies to,
-// and the ones a right-button drag paints in reverse with.
-const isBrushy = t => t === 'brush' || t === 'eraser';
+// and the ones a right-button drag paints in reverse with. The area eraser is
+// not one of them; it holds no brush.
+const isBrushy = t => t === 'brush' || (t === 'eraser' && ED.eraseMode !== 'area');
 // The adaptive region-grow runs when the brush's SHAPE is adaptive -- it is a
 // shape in ITK-SNAP's paintbrush panel, not a separate tool.
 const adaptiveOn = () => isBrushy(ED.tool) && ED.shape === 'adaptive';
@@ -974,8 +1306,11 @@ function drawPoly(g){
   if(!p.length) return;
   const scale = Math.max(1, ZOOM.scale);
   g.lineWidth = Math.max(0.5, 1.4/scale);
-  g.strokeStyle = '#38bdf8';
-  g.fillStyle = 'rgba(56,189,248,.16)';
+  // Blue adds, red takes away -- so an area eraser can never be mistaken for a
+  // fill halfway through tracing it.
+  const take = outlineSubtract();
+  g.strokeStyle = take ? '#f87171' : '#38bdf8';
+  g.fillStyle = take ? 'rgba(248,113,113,.18)' : 'rgba(56,189,248,.16)';
   g.beginPath();
   g.moveTo(p[0][0]+.5, p[0][1]+.5);
   for(let i=1;i<p.length;i++) g.lineTo(p[i][0]+.5, p[i][1]+.5);
@@ -989,7 +1324,7 @@ function drawPoly(g){
     // Every vertex is a handle in the editing state, traced curves included.
     for(let i=0;i<p.length;i++){
       g.beginPath(); g.arc(p[i][0]+.5, p[i][1]+.5, r, 0, 6.284);
-      g.fillStyle = '#38bdf8'; g.fill();
+      g.fillStyle = take ? '#f87171' : '#38bdf8'; g.fill();
     }
   } else {
     // While drawing, only the first vertex gets a handle: it is the close
@@ -1007,8 +1342,9 @@ function drawPoly(g){
    has no such counter, and now neither do we. */
 function polyHint(){
   const hint = $('#polyHint'); if(!hint) return;
+  const what = outlineSubtract() ? 'erases everything inside' : 'fills the outline';
   hint.textContent = ED.polyState === 'editing'
-    ? 'Drag a point to move it, shift-click to delete, click an edge to insert. Enter accepts.'
+    ? `Drag a point to move it, shift-click to delete, click an edge to insert. Enter ${what}.`
     : 'Trace round the boundary and let go back where you started — or click points. Enter closes.';
 }
 
@@ -1017,9 +1353,12 @@ function polyHint(){
    changes -- polyDraw() runs on every pointermove of a trace, and churning
    innerHTML there would break the drag. */
 function polyBarHTML(){
+  const take = outlineSubtract();
   const btns = ED.polyState === 'editing'
     ? `<button id="pCancel" title="Esc">Clear</button>
-       <button id="pAccept" class="primary" title="Enter — fill the outline">Accept ⏎</button>`
+       <button id="pAccept" class="primary" title="Enter — ${
+         take ? 'erase everything inside the outline' : 'fill the outline'}">${
+         take ? 'Erase' : 'Accept'} ⏎</button>`
     : `<button id="pPaste" title="Reuse the last outline you accepted — V">Paste last</button>
        <button id="pUndoPt" title="Backspace">Remove point</button>
        <button id="pCancel" title="Esc">Clear</button>
@@ -1080,11 +1419,12 @@ function polyAccept(quiet){
     return;
   }
   edPushUndo();
-  const n = polyFill(ED.poly, ED.subtract ? 0 : 1);
+  const take = outlineSubtract();
+  const n = polyFill(ED.poly, take ? 0 : 1);
   ED.lastPoly = ED.poly.map(p => [...p]);   // remembered for Paste last
   ED.dirty.add(SLICE);
   polyReset(); edRepaint();
-  toast(`${ED.subtract ? 'Removed' : 'Filled'} ${n} voxels`);
+  toast(`${take ? 'Erased' : 'Filled'} ${n} voxels`);
 }
 
 function polyPaste(){
@@ -1291,6 +1631,7 @@ async function edEnter(){
   ED.tool = PREFS.tool || 'polygon';
   ED.radius = PREFS.radius;
   ED.shape = PREFS.brushShape || 'round';
+  ED.eraseMode = PREFS.eraseMode === 'area' ? 'area' : 'brush';
   ED.brush3d = !!PREFS.brush3d;
   ED.adaptTol = PREFS.adaptTol;
   await loadVolume(SEL);
@@ -1346,7 +1687,7 @@ function selectTool(t){
   if(!SEL) return;
   if(ED.on || NAV_TOOLS.includes(t)){
     ED.tool = t;
-    if(t !== 'polygon') polyReset();
+    if(!outlining(t)) polyReset();
     PREFS.tool = t; savePrefs();
     renderDetail();
     return;
@@ -1406,7 +1747,7 @@ function bindPane(plane){
     capture(cv, e);
     const p = [u, v];
 
-    if(ED.tool === 'polygon'){
+    if(outlining(ED.tool)){
       const tol = Math.max(2, Math.round(4/Math.max(1, ZOOM.scale)));
       if(ED.polyState === 'editing'){
         // The outline is closed: clicks adjust it, they never extend it.
@@ -1472,7 +1813,7 @@ function bindPane(plane){
   cv.addEventListener('pointermove', e => {
     // Hovering over the close target while drawing highlights it, the same
     // feedback ITK-SNAP's m_HoverOverFirstVertex gives.
-    if(!ED.painting && editable() && ED.tool==='polygon' && ED.polyState==='drawing'){
+    if(!ED.painting && editable() && outlining(ED.tool) && ED.polyState==='drawing'){
       const hov = nearFirstVertex(e);
       if(hov !== ED.polyHover){ ED.polyHover = hov; drawPaneOverlay('axial'); }
       return;
@@ -1485,7 +1826,7 @@ function bindPane(plane){
     if(!editable()) return;
     const p = paneVoxel(plane, e);
 
-    if(ED.tool === 'polygon'){
+    if(outlining(ED.tool)){
       // Dragging straight after placing a point traces freehand from it;
       // dragging an existing point moves it.
       if(ED.polyFresh){
@@ -1533,7 +1874,7 @@ function bindPane(plane){
     // vertex closes the outline -- so tracing right round the boundary is one
     // stroke, ending where it began, and the shape is closed and editable.
     // Released anywhere else, the outline stays open for more clicks or drags.
-    if(ED.tool==='polygon' && ED.polyState==='drawing' && ED.painting
+    if(outlining(ED.tool) && ED.polyState==='drawing' && ED.painting
        && e && nearFirstVertex(e)){
       polyComplete();
     }
@@ -1606,6 +1947,17 @@ function bindEditorToolbar(){
     btn.onclick = () => {
       ED.shape = btn.dataset.shape; PREFS.brushShape = ED.shape;
       savePrefs(); renderDetail();
+    };
+  });
+  document.querySelectorAll('#tEraseSeg button').forEach(btn => {
+    btn.onclick = () => {
+      if(ED.eraseMode === btn.dataset.erase) return;
+      ED.eraseMode = btn.dataset.erase; PREFS.eraseMode = ED.eraseMode;
+      savePrefs();
+      // Switching away from the area eraser mid-outline would leave an outline
+      // on screen that no tool owns any more.
+      polyReset();
+      renderDetail();
     };
   });
   on('#t3d',    () => { ED.brush3d = !ED.brush3d; PREFS.brush3d = ED.brush3d;
@@ -1696,15 +2048,26 @@ function toolbarHTML(){
     <div id="edBar">
       ${b('tPoly','P','✎ Freehand','polygon','P or 3 — trace round the boundary and let go back where you started; adjust, then Accept. Clicks add single points too.')}
       ${b('tBrush','B','● Brush','brush','B — paint voxels; right-drag erases')}
-      ${b('tErase','E','⌫ Erase','eraser','E')}
+      ${b('tErase','E','⌫ Erase','eraser','E — take voxels away, either with a brush or by drawing round an area')}
       ${b('tFill','G','◉ Fill','fill','G — fill an enclosed area, or remove a whole blob')}
       ${b('tCut','K','✂ Cut','scalpel','K — draw a line to cut the mask in two')}
       ${b('tRuler','R','↔ Ruler','ruler','R or 6 — drag to measure a distance in mm')}
       ${b('tCross','C','✛ Navigate','cross','1 — move the crosshair without painting; right-drag zooms, middle-drag pans')}
       ${b('tZoom','Z','⤢ Zoom/pan','zoom','2 — left-drag pans, right-drag zooms')}
       <span class="sep"></span>
-      <button id="tMode" title="M — whether the outline and fill tools add or take away"
-        >${ED.subtract ? '− subtract' : '+ add'}</button>
+      ${eraseArea()
+        ? `<button id="tMode" disabled
+             title="The area eraser always takes away — that is what it is for">− erase</button>`
+        : `<button id="tMode" title="M — whether the outline and fill tools add or take away"
+             >${ED.subtract ? '− subtract' : '+ add'}</button>`}
+      ${ED.tool==='eraser' ? `
+      <span class="sep"></span>
+      <span id="tEraseSeg">
+        <button data-erase="brush" class="${ED.eraseMode!=='area'?'on':''}"
+          title="Brush eraser — drag over voxels to take them away">brush</button
+        ><button data-erase="area" class="${ED.eraseMode==='area'?'on':''}"
+          title="Area eraser — draw round a region and press Enter; everything inside it goes. ITK-SNAP's polygon in erase mode.">area</button>
+      </span>` : ''}
       ${brushy ? `
       <span class="sep"></span>
       <span id="tShapeSeg">
@@ -1742,7 +2105,7 @@ function toolbarHTML(){
       <button id="tDiscard">Discard</button>
       <button id="tSave" class="primary">Save mask</button>
     </div>
-    ${ED.tool==='polygon' ? `
+    ${outlining(ED.tool) ? `
     <div id="polyBar">${polyBarHTML()}</div>` : ''}`;
 }
 
@@ -1790,6 +2153,7 @@ function renderDetail(){
       <div>
         ${ED.on ? toolbarHTML() : ''}
         <div id="panes">
+          <div id="axRow" class="${t1Showing()?'withT1':''}">
           ${paneHTML('axial', 'canvas', 'axWrap', `
             <div id="hasMask">tumour on this slice</div>
             <div id="posRead"></div>
@@ -1800,6 +2164,8 @@ function renderDetail(){
               <button id="zIn" title="Zoom in (+)">+</button>
               <button id="zReset" title="Reset zoom (0)">⟲</button>
             </div>`)}
+          ${t1Showing() ? t1PaneHTML() : ''}
+          </div>
           <div id="reformats" style="display:${PREFS.threeUp?'grid':'none'}">
             ${paneHTML('coronal','paneCo')}
             ${paneHTML('sagittal','paneSa')}
@@ -1819,6 +2185,10 @@ function renderDetail(){
             title="Show the coronal and sagittal reformats (T)">Three planes</button>
           <button id="btnCross" title="Show or hide the linked crosshair (⇧X or H)"
             >${PREFS.crosshair===false?'Show':'Hide'} crosshair</button>
+          <button id="btnT1" class="${t1Showing()?'primary':''}"
+            title="Show the T1 next to the T2, scrolling together (⇧⌘G).${
+              c.t1 ? '' : ' This scan has no T1 stored yet.'}"
+            >${t1Showing() ? 'Hide' : 'Show'} T1</button>
           <span class="spacer"></span>
           <span class="meta">scroll to change slice · click any pane to move the crosshair</span>
         </div>
@@ -1920,6 +2290,7 @@ function renderDetail(){
   $('#btnCross').onclick = () => {
     PREFS.crosshair = PREFS.crosshair === false; savePrefs(); renderDetail();
   };
+  $('#btnT1').onclick = toggleT1;
 
   // Scroll wheel / two-finger scroll moves through slices, the way it works in
   // every radiology viewer. deltaY is accumulated rather than acted on
@@ -1957,6 +2328,7 @@ function renderDetail(){
     $('#canvas').classList.remove('loading');
     bindPane('axial');
     if(PREFS.threeUp){ bindPane('coronal'); bindPane('sagittal'); }
+    bindT1Pane();
     renderAllPanes();
     bindDisplay();
   }).catch(e => {
@@ -2457,6 +2829,9 @@ document.addEventListener('keydown', e => {
     autoWindow(); renderAllPanes(); updateWLReadout();
     toast('Contrast set from the image'); return; }
   if(mod && k==='f' && SEL){ e.preventDefault(); zoomReset(); return; }  // zoom to fit
+  // ITK-SNAP opens an additional image from the File menu; ⇧⌘G is the shortcut
+  // the lab asked for. It toggles, so the same keys put the pane away again.
+  if(mod && e.shiftKey && k==='g'){ e.preventDefault(); toggleT1(); return; }
   if(mod) return;   // leave every other browser shortcut alone
 
   if(SEL){
@@ -2489,7 +2864,7 @@ document.addEventListener('keydown', e => {
       e.preventDefault(); window._setSlice(SLICE-1); return; }
 
     /* ---- outline keys, before tool selection claims their letters ---- */
-    if(ED.on && ED.tool==='polygon'){
+    if(ED.on && outlining(ED.tool)){
       if(e.key==='Enter'){ e.preventDefault(); polyAccept(); return; }
       if(e.key==='Backspace' && ED.polyState!=='editing'){
         e.preventDefault(); (ED.poly||[]).pop();
@@ -2515,7 +2890,13 @@ document.addEventListener('keydown', e => {
   if(ED.on){
     const tk = {e:'eraser', g:'fill', k:'scalpel'}[k];
     if(tk){ selectTool(tk); return; }
-    if(k==='m'){ ED.subtract=!ED.subtract; renderDetail(); return; }
+    // The area eraser owns its direction, so M does nothing while it is on --
+    // the toolbar says so too, rather than letting a key silently miss.
+    if(k==='m'){
+      if(eraseArea()) toast('The area eraser always takes away');
+      else { ED.subtract=!ED.subtract; renderDetail(); }
+      return;
+    }
     if(e.key==='[' || e.key===']'){ adjustBrushRadius(e.key==='[' ? -1 : 1); return; }
     // +/- are ITK-SNAP's brush-size keys; on other tools they stay zoom.
     if(e.key==='+' || e.key==='=' || e.key==='-' || e.key==='_'){
@@ -2557,6 +2938,29 @@ document.addEventListener('keydown', e => {
   }
 });
 
+/* The desktop shell's menu, which owns ⌘Z, ⇧⌘Z, ⌘S and ⇧⌘G before the page
+   ever sees them (a macOS menu swallows its own key equivalents). Each item
+   lands here and does exactly what the in-page shortcut does -- with one
+   addition: ⌘Z outside the editor falls back to the text field under the
+   cursor, so undo in the review note still works. */
+if(window.desktopBridge?.onMenu){
+  window.desktopBridge.onMenu(action => {
+    const typing = isTypingTarget(document.activeElement || document.body);
+    if(action === 'undo'){
+      if(ED.on && !typing) edApplySnapshot(ED.undo, ED.redo);
+      else document.execCommand('undo');
+      return;
+    }
+    if(action === 'redo'){
+      if(ED.on && !typing) edApplySnapshot(ED.redo, ED.undo);
+      else document.execCommand('redo');
+      return;
+    }
+    if(action === 'save' && ED.on){ edSave(); return; }
+    if(action === 'toggleT1'){ toggleT1(); return; }
+  });
+}
+
 // Losing hand-drawn work to a stray click or a closed tab would be
 // unforgivable, so every route out of the editor is guarded.
 window.addEventListener('beforeunload', e => {
@@ -2597,6 +3001,10 @@ function unsupported(){
     await probeHelper();
     await refreshFolder();
     await refresh();
+    // After the first render, never before: the account check is a network
+    // round trip, and a reviewer working locally should not wait on a server
+    // that may not even be there. It repaints the header when it lands.
+    mountAccountUI({ onSwitch: refresh }).catch(e => console.warn('accounts unavailable:', e));
     // The model finishes starting later — seconds on a cached copy, minutes on
     // a first visit over a slow connection. Re-render while it downloads so the
     // card shows progress, and once more when it settles.

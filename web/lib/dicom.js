@@ -351,3 +351,23 @@ export const T2_AXIAL_SEQUENCE_PREFIX = 'T2w FSE (axial';
 export function isT2Axial(m) {
   return m.sequenceName.startsWith(T2_AXIAL_SEQUENCE_PREFIX);
 }
+
+/**
+ * The T1 axial companion, which the lab reads alongside the T2.
+ *
+ * `SequenceName` is VR SH and therefore truncated to 16 characters, so the
+ * study's `T1w FSE (axial,n)` arrives as `T1w FSE (axial`. Matching the prefix
+ * is the same rule `isT2Axial` uses, and for the same reason:
+ * `SeriesDescription` is "MRI 'FSE26' Scan" for the T2 axial, the T2 coronal
+ * AND the T1 axial, so it cannot tell them apart.
+ *
+ * This series is never segmented and never contributes a number -- it is shown
+ * next to the T2 and nothing else -- so a scan that misses it simply has no T1
+ * pane, which is what happens for the sessions that were never acquired with
+ * one.
+ */
+export const T1_AXIAL_SEQUENCE_PREFIX = 'T1w FSE (axial';
+
+export function isT1Axial(m) {
+  return m.sequenceName.startsWith(T1_AXIAL_SEQUENCE_PREFIX);
+}

@@ -73,7 +73,15 @@ dependencies, no backend. Point it at a folder of DICOM and it converts, runs a
 model, computes volumes, renders QC images, and gives you a three-plane viewer
 with a full mask editor: freehand, polygon, brush, adaptive brush, flood fill,
 cut, ruler, shape-based slice interpolation, window/level, and undo across the
-whole volume.
+whole volume. The eraser has ITK-SNAP's two shapes — a brush, or an outlined
+area that takes everything inside it away on ⏎.
+
+The **T1 axial companion** (⇧⌘G) is shown beside the T2 when the session was
+acquired with one: it is captured at ingest, stored next to the scan, and tied
+to the T2 through physical millimetres rather than slice index, because the two
+are separate acquisitions on separate grids (15 slices at 1.20 mm against 18 at
+1.10 mm here). It scrolls with the T2 and is display only — never segmented,
+never part of a volume.
 
 **Nothing is uploaded.** The DICOM is decoded and segmented inside the browser
 tab, and `web/_headers` sets `connect-src 'self'` so the page is not permitted
@@ -93,7 +101,7 @@ It is a port of a Flask app, and the geometry is the part worth trusting:
   `SignedMaurerDistanceMap`, and connected components against
   `ConnectedComponent`. On a 20-session sweep **every voxel was identical as
   float32**, and every distance field exact.
-* `web/test/run_selftest.py` runs 37 end-to-end checks in a real browser against
+* `web/test/run_selftest.py` runs 48 end-to-end checks in a real browser against
   synthetic DICOM it writes itself, so it needs no data and can be run anywhere:
 
   ```bash

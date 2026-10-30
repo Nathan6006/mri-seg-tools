@@ -33,7 +33,7 @@
 
 'use strict';
 
-const { app, BrowserWindow, dialog, ipcMain, net, protocol, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, net, protocol, session, shell } = require('electron');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
@@ -403,6 +403,68 @@ function registerIpc() {
   });
 }
 
+/* ======================= the menu ======================= */
+/**
+ * A real application menu, for one reason that matters and one that is nice.
+ *
+ * THE ONE THAT MATTERS: on macOS the DEFAULT menu owns ⌘Z, and its Undo item
+ * is the text-field `undo` role -- it calls `webContents.undo()`, which does
+ * nothing at all to a canvas. The page has had an undo stack the whole time;
+ * the key equivalent was being eaten before the page saw it. These items send
+ * the intent to the renderer instead, which decides between the mask undo and
+ * a text field's own undo depending on where focus is.
+ *
+ * The nice one: the lab asked for ITK-SNAP's "open another image" on ⇧⌘G, and
+ * a menu is where someone looks for it when they have forgotten the keys.
+ */
+function toPage(item, win, action) {
+  const target = win || BrowserWindow.getFocusedWindow();
+  if (target) target.webContents.send('menu', action);
+}
+
+function buildMenu() {
+  const mac = process.platform === 'darwin';
+  const template = [
+    ...(mac ? [{ role: 'appMenu' }] : []),
+    {
+      label: 'File',
+      submenu: [
+        {
+          label: 'Open T1 for this scan',
+          accelerator: 'CmdOrCtrl+Shift+G',
+          click: (i, w) => toPage(i, w, 'toggleT1'),
+        },
+        { label: 'Save mask', accelerator: 'CmdOrCtrl+S', click: (i, w) => toPage(i, w, 'save') },
+        { type: 'separator' },
+        mac ? { role: 'close' } : { role: 'quit' },
+      ],
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        // NOT the `undo`/`redo` roles: those are the text-field ones.
+        { label: 'Undo', accelerator: 'CmdOrCtrl+Z', click: (i, w) => toPage(i, w, 'undo') },
+        { label: 'Redo', accelerator: 'Shift+CmdOrCtrl+Z', click: (i, w) => toPage(i, w, 'redo') },
+        { type: 'separator' },
+        { role: 'cut' }, { role: 'copy' }, { role: 'paste' },
+        { role: 'selectAll' },
+      ],
+    },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' }, { role: 'toggleDevTools' },
+        { type: 'separator' },
+        { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' },
+      ],
+    },
+    { role: 'windowMenu' },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
 /* ======================= window ======================= */
 
 function createWindow() {
@@ -499,8 +561,16 @@ async function runE2E(win) {
       if (${E2E_VERIFY ? 'true' : 'false'}) {
         // Second launch on the same profile: the import below already ran.
         const cases = Backend.state().cases;
-        step('persisted_cases', cases.map(c => ({ case: c.case, vol: c.auto_volume_mm3 })));
+        step('persisted_cases', cases.map(c => ({ case: c.case, vol: c.auto_volume_mm3,
+                                                  t1: c.t1 ? c.t1.series : null })));
         if (!cases.length) throw new Error('no cases survived the relaunch');
+        // The T1 is stored beside the scan, so it has to come back with it.
+        const withT1 = cases.filter(c => c.t1);
+        for (const c of withT1) {
+          const t1 = await Backend.t1Raw(c.case);
+          if (!t1) throw new Error(c.case + ': the T1 record survived but the image did not');
+        }
+        step('persisted_t1', withT1.length);
         out.ok = true;
         return out;
       }
@@ -519,6 +589,25 @@ async function runE2E(win) {
       const c = cases[0];
       step('case', { case: c.case, volume: c.auto_volume_mm3,
                      slices: c.n_tumor_slices, components: c.n_components });
+
+      // 1b. The T1 companion. This folder has a T1 axial series, so it must
+      //     have been captured -- on its OWN grid, which is the whole reason
+      //     the viewer lines the two up in millimetres rather than by index.
+      step('t1_record', c.t1);
+      if (!c.t1) throw new Error('the T1 axial series in this folder was not captured');
+      const t1 = await Backend.t1Raw(c.case);
+      if (!t1) throw new Error('the T1 record is there but no image was stored');
+      step('t1_volume', { size: [t1.meta.nx, t1.meta.ny, t1.meta.nz],
+                          spacing: [t1.meta.sx, t1.meta.sy, t1.meta.sz],
+                          origin: t1.meta.origin, series: t1.meta.series });
+      if (!(t1.meta.origin || []).length || !(t1.meta.direction || []).length)
+        throw new Error('the T1 came back with no physical placement');
+      if (t1.data.length !== t1.meta.nx * t1.meta.ny * t1.meta.nz)
+        throw new Error('the T1 image does not match its own dimensions');
+      const t2geom = await Backend.volumeRaw(c.case);
+      step('t2_geometry', { origin: t2geom.meta.origin, direction: t2geom.meta.direction });
+      if (!(t2geom.meta.origin || []).length)
+        throw new Error('the T2 no longer carries its origin, so nothing can be lined up with it');
 
       // 2. Link the export folder and write the case, as the buttons do.
       const link = await Backend.linkFolder();
@@ -600,8 +689,63 @@ async function runE2E(win) {
     if (!ui.ok) { r.ok = false; r.error = 'keyboard: ' + ui.error; }
   }
 
+  // Third phase: the application menu. Its key equivalents never reach the
+  // page -- a macOS menu eats its own -- so ⌘Z arrives as an IPC message
+  // instead, and THAT is the leg worth testing: the page's own keydown
+  // handler is already covered above, and was never the thing that was broken.
+  if (r.ok && !E2E_VERIFY) {
+    const menu = await runMenuPhase(win);
+    for (const s of menu.steps) console.log(`[e2e:menu] ${s.name}:`, JSON.stringify(s.v ?? true));
+    if (!menu.ok) { r.ok = false; r.error = 'menu: ' + menu.error; }
+  }
+
   console.log(r.ok ? '[e2e] PASS' : `[e2e] FAIL: ${r.error}`);
   app.exit(r.ok ? 0 : 1);
+}
+
+/**
+ * Drive the menu items the way the menu does -- by sending their action to the
+ * page -- and check the page did the thing.
+ */
+async function runMenuPhase(win) {
+  const out = { steps: [], ok: false };
+  const step = (name, v) => out.steps.push({ name, v });
+  const evaluate = (src) => win.webContents.executeJavaScript(src, true);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    if (!await evaluate(`!!window.desktopBridge && !!window.desktopBridge.onMenu`)) {
+      throw new Error('the bridge does not expose the menu channel');
+    }
+
+    // Editing again, then an edit that is certainly an edit: clear the slice.
+    await evaluate(`(async () => {
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      document.dispatchEvent(new KeyboardEvent('keydown', {key:'3', bubbles:true, cancelable:true}));
+      for (let i = 0; i < 100 && !document.querySelector('#tClear'); i++) await sleep(150);
+      await sleep(600);
+      document.querySelector('#tClear').click();
+      await sleep(200);
+      return true;
+    })()`);
+    const dirty0 = await evaluate(`!!document.querySelector('#edStats2 .dirty')`);
+    step('edit_made', dirty0);
+    if (!dirty0) throw new Error('clearing the slice did not mark it edited');
+
+    win.webContents.send('menu', 'undo');
+    await sleep(500);
+    const dirty1 = await evaluate(`!!document.querySelector('#edStats2 .dirty')`);
+    step('menu_undo', { dirty0, dirty1 });
+    if (dirty1) throw new Error('the menu Undo did not reach the mask');
+
+    win.webContents.send('menu', 'toggleT1');
+    await sleep(1200);
+    const pane = await evaluate(`!!document.querySelector('#paneT1')`);
+    step('menu_open_t1', pane);
+    if (!pane) throw new Error('the menu did not open the T1');
+
+    out.ok = true;
+  } catch (e) { out.error = e.message; }
+  return out;
 }
 
 const UI_KEYS_SCRIPT = `(async () => {
@@ -707,6 +851,86 @@ const UI_KEYS_SCRIPT = `(async () => {
       step('undo_restores');
     }
 
+    // The AREA ERASER: draw round a region, press Enter, everything inside it
+    // goes. Filled first with the outline tool so there is certainly something
+    // to take away, then erased with the same gesture -- which is the whole
+    // claim: same gesture, opposite effect.
+    {
+      const voxels = () => {
+        const m = /([0-9]+) voxels/.exec(document.querySelector('#edStats2').textContent || '');
+        return m ? +m[1] : NaN;
+      };
+      const settled = async () => {
+        const img = document.querySelector('#axImg');
+        if (!await waitFor(() => img && img.width > 1, 30000))
+          throw new Error('the axial canvas was never sized');
+        await sleep(400);
+        return document.querySelector('#axOvr');
+      };
+      const trace = async (ovr) => {
+        const r = ovr.getBoundingClientRect();
+        const pt = (t, x, y, extra = {}) => ovr.dispatchEvent(new PointerEvent(t,
+          Object.assign({ bubbles: true, cancelable: true, pointerId: 9,
+                          button: 0, buttons: 1, clientX: x, clientY: y }, extra)));
+        const cx = r.left + r.width / 2, cy = r.top + r.height / 2, rad = r.width * 0.2;
+        pt('pointerdown', cx + rad, cy);
+        for (let i = 1; i <= 40; i++) {
+          const a = i / 40 * 2 * Math.PI;
+          pt('pointermove', cx + rad * Math.cos(a), cy + rad * Math.sin(a));
+        }
+        pt('pointerup', cx + rad, cy, { buttons: 0 });
+        await sleep(200);
+        key('Enter');
+        await sleep(250);
+      };
+
+      const v0 = voxels();
+      await trace(await settled());
+      const v1 = voxels();
+      if (!(v1 > v0)) throw new Error('the outline did not fill: ' + v0 + ' -> ' + v1);
+
+      key('e');
+      if (!await waitFor(() => document.querySelector('#tErase.on'), 5000))
+        throw new Error('E did not select the eraser');
+      const area = await waitFor(() => document.querySelector('#tEraseSeg button[data-erase=area]'), 5000);
+      if (!area) throw new Error('the eraser has no area option');
+      area.click();
+      if (!await waitFor(() => document.querySelector('#polyBar'), 5000))
+        throw new Error('the area eraser does not draw an outline');
+      step('area_eraser_selected');
+
+      await trace(await settled());
+      const v2 = voxels();
+      step('area_eraser', { v0, v1, v2 });
+      if (!(v2 < v1)) throw new Error('the area eraser removed nothing: ' + v1 + ' -> ' + v2);
+      if (v2 > v0) throw new Error('the area eraser left voxels the fill had added');
+
+      key('z', { metaKey: true });
+      key('z', { metaKey: true });
+      await sleep(250);
+      if (voxels() !== v0) throw new Error('undo did not restore the mask after erasing');
+      step('area_eraser_undo_restores');
+    }
+
+    // The T1 companion in the UI: ⇧⌘G opens it, and it follows the T2 through
+    // the stack -- the two scrolling together is the point of it.
+    {
+      key('g', { metaKey: true, shiftKey: true });
+      const pane = await waitFor(() => document.querySelector('#paneT1'), 20000);
+      if (!pane) throw new Error('shift-cmd-G did not open the T1 pane');
+      const lab0 = document.querySelector('#t1Lab').textContent;
+      for (let i = 0; i < 6; i++) { key('PageDown'); await sleep(80); }
+      await sleep(250);
+      const lab1 = document.querySelector('#t1Lab').textContent;
+      step('t1_follows_slices', { lab0, lab1 });
+      if (!lab0 || lab0 === lab1)
+        throw new Error('the T1 did not move with the T2: ' + lab0 + ' / ' + lab1);
+      key('g', { metaKey: true, shiftKey: true });
+      await sleep(300);
+      if (document.querySelector('#paneT1')) throw new Error('shift-cmd-G did not close the T1 pane');
+      step('t1_toggles_closed');
+    }
+
     key('4');
     if (!await waitFor(() => document.querySelector('#tBrush.on'), 5000))
       throw new Error('4 did not select the brush');
@@ -787,6 +1011,7 @@ app.whenReady().then(() => {
   protocol.handle('app', serveWeb);
   registerIpc();
   setAboutPanel();
+  buildMenu();
 
   // Results live in IndexedDB in this app's own profile; nothing evicts them,
   // but saying so to the page keeps its storage banner honest.

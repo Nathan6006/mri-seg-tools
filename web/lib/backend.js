@@ -30,10 +30,51 @@ import { readNifti, writeNiftiGz } from './nifti.js';
 import { signedDistance } from './edt.js';
 import { getPredictor } from './predictor.js';
 import { zip } from './gz.js';
-import * as store from './store.js';
+import * as localStore from './store.js';
+import * as cloudStore from './cloudstore.js';
+
+/**
+ * Which storage this session is using.
+ *
+ * `store` is a mutable binding rather than a namespace import, which is the
+ * whole of what it costs to support both. Every `store.foo()` call below is
+ * unchanged, and the viewer above never learns the difference.
+ *
+ * IT STARTS LOCAL, DELIBERATELY. Anyone who has used this tool before has
+ * cases in IndexedDB, and booting into a signed-out cloud workspace would
+ * present them with an empty worklist and no obvious way back to their work.
+ * Signing in is something you choose, and switching back is always possible:
+ * nothing here ever deletes the local store.
+ */
+let store = localStore;
+
+export const STORAGE_LOCAL = 'local';
+export const STORAGE_CLOUD = 'cloud';
+let storageMode = STORAGE_LOCAL;
+
+export function storageMode_() { return storageMode; }
+
+/** Switch backends and reload the worklist from whichever is now active. */
+export async function useStorage(mode, config = null) {
+  if (mode === STORAGE_CLOUD) {
+    if (!config?.workspaceId) throw new Error('a workspace is required');
+    cloudStore.configure(config);
+    store = cloudStore;
+  } else {
+    store = localStore;
+  }
+  storageMode = mode;
+  cacheDrop();
+  STATE.cases = await store.allCases();
+  await refreshStorage();
+  return state();
+}
+
+export { cloudStore };
 import {
-  EditedMaskError, LABEL_FILE, fileNames, finalVolume, importCorrectedMask,
-  processSession, refreshEdits, resultsJson, revertToAuto, volumesCsv,
+  EditedMaskError, LABEL_FILE, attachT1, fileNames, finalVolume,
+  importCorrectedMask, processSession, refreshEdits, resultsJson, revertToAuto,
+  volumesCsv,
 } from './pipeline.js';
 import { groupSessions } from './volume.js';
 import * as fs from './fsaccess.js';
@@ -297,7 +338,20 @@ export async function forgetModel() {
 
 async function refreshStorage() {
   const u = await store.usage();
-  if (u) STATE.storage = { ...STATE.storage, used: u.used, quota: u.quota };
+  // The POLICY is recomputed too, not just the byte counts. It used to be set
+  // once in init(), which was correct while there was only one backend and
+  // became a lie the moment storage could be switched underneath a running
+  // page: the readout would keep promising "kept until this disk runs low on
+  // space" about results that were by then on the server. Where the data
+  // lives is the one thing this readout exists to state, so it has to follow
+  // the backend rather than the page load.
+  const p = await store.requestPersistence();
+  STATE.storage = {
+    ...STATE.storage, ...p,
+    used: u?.used ?? null,
+    quota: u?.quota ?? null,
+    policy: store.storagePolicy(p.persisted),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -438,9 +492,72 @@ export async function volumeRaw(name) {
     meta: {
       nx: vol.nx, ny: vol.ny, nz: vol.nz,
       sx: vol.spacing[0], sy: vol.spacing[1], sz: vol.spacing[2],
+      // The physical placement of the grid, needed to line a second image up
+      // with this one. It costs nothing to carry and cannot be reconstructed
+      // from the sizes and spacings alone.
+      origin: vol.origin, direction: vol.direction,
       vmin, vmax, hist,
     },
   };
+}
+
+/**
+ * The T1 axial companion for a case, in the same shape `volumeRaw` returns.
+ *
+ * It is on ITS OWN GRID -- a different acquisition, different slice count,
+ * different spacing -- so origin and direction come with it and the viewer
+ * lines the two up in millimetres rather than by index. Returns null when the
+ * case has no T1, which is the normal answer for many sessions.
+ */
+export async function t1Raw(name) {
+  const rec = byName(name);
+  if (!rec) throw new Error('no such case');
+  const bytes = await store.getFile(name, 't1');
+  if (!bytes) return null;
+  const vol = await readNifti(bytes);
+
+  let vmin = Infinity, vmax = -Infinity;
+  for (let i = 0; i < vol.data.length; i++) {
+    if (vol.data[i] < vmin) vmin = vol.data[i];
+    if (vol.data[i] > vmax) vmax = vol.data[i];
+  }
+  const span = Math.max(vmax - vmin, 1e-6);
+  const u16 = new Uint16Array(vol.data.length);
+  const hist = new Array(256).fill(0);
+  for (let i = 0; i < vol.data.length; i++) {
+    const v = Math.max(0, Math.min(65535,
+      Math.round((vol.data[i] - vmin) / span * 65535)));
+    u16[i] = v;
+    hist[Math.min(255, (v / 256) | 0)]++;
+  }
+  return {
+    data: u16,
+    meta: {
+      nx: vol.nx, ny: vol.ny, nz: vol.nz,
+      sx: vol.spacing[0], sy: vol.spacing[1], sz: vol.spacing[2],
+      origin: vol.origin, direction: vol.direction,
+      vmin, vmax, hist,
+      series: rec.t1?.series ?? null, sequence: rec.t1?.sequence ?? null,
+    },
+  };
+}
+
+/**
+ * Load a T1 for a case from its scan folder, picked again by the user.
+ *
+ * Cases segmented before the T1 was captured have none stored, and the DICOM
+ * is not kept, so the folder has to be handed over once more. Nothing but the
+ * T1 is read from it -- no mask, volume or hash is touched.
+ *
+ * @returns {Promise<object|null>} the updated record, or null if that folder
+ *          has no T1 axial series in it.
+ */
+export async function loadT1From(name, entries) {
+  const rec = byName(name);
+  if (!rec) throw new Error('no such case');
+  const updated = await attachT1(rec, entries);
+  if (updated) await refreshStorage();
+  return updated;
 }
 
 /** The working mask: one byte per voxel, same order as the scan. */

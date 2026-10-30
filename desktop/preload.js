@@ -41,4 +41,12 @@ contextBridge.exposeInMainWorld('desktopBridge', {
   // -- ITK-SNAP --------------------------------------------------------------
   itksnapAvailable: () => ipcRenderer.invoke('itksnap:available'),
   itksnapOpen: (caseName) => ipcRenderer.invoke('itksnap:open', caseName),
+
+  // -- the application menu -------------------------------------------------
+  // Menu key equivalents never reach the page on macOS -- the menu eats them
+  // first -- so the items that mean something to the page (undo, redo, save,
+  // open the T1) arrive here instead. The page decides what each one does.
+  onMenu: (fn) => {
+    ipcRenderer.on('menu', (_e, action) => fn(String(action)));
+  },
 });

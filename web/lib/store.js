@@ -100,7 +100,7 @@ export async function deleteCase(name) {
   const db = await open();
   const tx = db.transaction([CASES, FILES], 'readwrite');
   tx.objectStore(CASES).delete(name);
-  for (const kind of ['image', 'auto_mask', 'mask', 'qc', 'workspace']) {
+  for (const kind of ['image', 'auto_mask', 'mask', 'qc', 'workspace', 't1']) {
     tx.objectStore(FILES).delete(fileKey(name, kind));
   }
   return new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
