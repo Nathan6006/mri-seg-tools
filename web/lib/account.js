@@ -319,6 +319,7 @@ function workspacePicker(revalidated = false) {
 
     foot.append(
       el('button', { class: 'ghost', onclick: switchToLocal }, 'Use local storage'),
+      el('button', { class: 'ghost', onclick: changePassword }, 'Password'),
       UI.user.isAdmin
         ? el('button', { class: 'ghost', onclick: adminPanel }, 'Accounts')
         : null,
@@ -635,6 +636,43 @@ function adminPanel() {
           } catch (e) { errorInto(body, e.message); }
         } }, 'Check storage'));
   }, { wide: true });
+}
+
+/* -------------------------------------------------------- password change */
+
+function changePassword() {
+  sheet('Change password', (body, foot) => {
+    body.append(el('p', { class: 'a-hintline', style: 'margin:0 0 6px' },
+      'Signing out everywhere else is the point of this, so every other '
+      + 'session is ended. This tab stays signed in.'));
+
+    const cur = el('input', { type: 'password', autocomplete: 'current-password' });
+    const nxt = el('input', { type: 'password', autocomplete: 'new-password' });
+    const again = el('input', { type: 'password', autocomplete: 'new-password' });
+    body.append(
+      el('label', {}, 'Current password'), cur,
+      el('label', {}, 'New password'), nxt,
+      el('div', { class: 'a-hintline' }, 'At least 8 characters. Length beats punctuation.'),
+      el('label', {}, 'New password again'), again);
+
+    const save = el('button', { class: 'primary', onclick: async () => {
+      if (nxt.value !== again.value) { errorInto(body, 'The two new passwords do not match.'); return; }
+      save.disabled = true; save.textContent = 'Saving…';
+      try {
+        await postJson('/api/auth/password',
+          { currentPassword: cur.value, newPassword: nxt.value });
+        closeSheet();
+        alert('Password changed. Any other signed-in browsers have been signed out.');
+      } catch (e) {
+        errorInto(body, e.message);
+        save.disabled = false; save.textContent = 'Change password';
+      }
+    } }, 'Change password');
+
+    foot.append(el('button', { class: 'ghost', onclick: () => workspacePicker() }, 'Back'),
+      el('span', { class: 'spacer' }), save);
+    cur.focus();
+  });
 }
 
 /* ------------------------------------------------------------- switching */

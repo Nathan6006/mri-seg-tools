@@ -29,7 +29,7 @@
 import {
   SESSION_COOKIE, createSession, destroySession, hashPassword, randomId,
   readCookie, sessionCookie, throttleCheck, throttleClear, throttleFail,
-  userForToken, verifyPassword,
+  sha256Hex, userForToken, verifyPassword,
 } from './auth.js';
 import { checkWrite, reconcile, settings, usage } from './quota.js';
 
@@ -190,6 +190,44 @@ async function handleLogin(request, env, url) {
     } },
     { headers: { 'Set-Cookie': sessionCookie(token, url) } },
   );
+}
+
+/**
+ * Change your own password.
+ *
+ * Requires the current one even though the caller is already signed in. The
+ * session cookie proves the browser was logged in at some point, not that
+ * the person at the keyboard is the owner -- an unattended laptop is the
+ * ordinary case this stops.
+ *
+ * Every OTHER session is destroyed on success, which is the point of
+ * changing a password you think someone else may know. The current one is
+ * kept so the person is not immediately logged out of the tab they are
+ * working in.
+ */
+async function handleChangePassword(request, env, user, token) {
+  const body = await readJson(request);
+  const current = String(body?.currentPassword || '');
+  const next = String(body?.newPassword || '');
+
+  if (next.length < 8) return fail(400, 'The new password must be at least 8 characters.');
+  if (next.length > 512) return fail(400, 'That password is too long.');
+  if (next === current) return fail(400, 'That is the password you already have.');
+
+  const row = await env.DB.prepare('SELECT pw_hash FROM users WHERE id = ?')
+    .bind(user.id).first();
+  if (!row || !await verifyPassword(current, row.pw_hash)) {
+    return fail(403, 'That is not your current password.');
+  }
+
+  const keep = await sha256Hex(token);
+  await env.DB.batch([
+    env.DB.prepare('UPDATE users SET pw_hash = ? WHERE id = ?')
+      .bind(await hashPassword(next), user.id),
+    env.DB.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?')
+      .bind(user.id, keep),
+  ]);
+  return json({ ok: true, otherSessionsEnded: true });
 }
 
 async function handleLogout(request, env, url) {
@@ -648,6 +686,10 @@ async function route(request, env, url) {
     return user ? json({ user }) : json({ user: null }, { status: 401 });
   }
   if (!user) return fail(401, 'Please sign in.');
+
+  if (path === '/api/auth/password' && method === 'POST') {
+    return handleChangePassword(request, env, user, readCookie(request, SESSION_COOKIE));
+  }
 
   /* -- admin -- */
   if (path.startsWith('/api/admin/')) {
