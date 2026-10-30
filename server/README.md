@@ -108,9 +108,36 @@ Verified in a browser: a case written to local storage, with its mask bytes
 and volume, is byte-identical after switching to a cloud workspace and back.
 The two stores never see each other.
 
-## Costs
+## Costs, and what happens when something runs out
 
-Free, with the measured headroom being storage: a 329-session study is about
-800 MB against R2's 10 GB free allowance. Reads and writes land near 0.02%
-of the free operation limits, and R2 charges nothing for egress, which is
-the property that matters when the payload is imaging.
+Free at this scale, but the three services fail in **two different ways**,
+and the difference is the thing to know.
+
+| | Free allowance | Current use | Over the line |
+|---|---|---|---|
+| R2 — scans and masks | 10 GB, egress free | ~800 MB for a 329-session study | **billed**, $0.015/GB-month |
+| D1 — accounts, metadata | 500 MB per database (5 GB/account), 5M row reads + 100k row writes a day | a few MB; ~1,000 writes to import a whole study | **blocked**, queries error |
+| Workers — the API | 100k requests/day | a few thousand per reviewer per pass | **blocked**, requests error |
+
+**Static assets, including the 149 MB of weights, are served free and
+unlimited** and do not count against the Workers request limit. Only
+`/api/*` invokes the Worker.
+
+So the only line that can produce a bill rather than an error is R2
+storage, because enabling R2 requires a payment method and its overage is
+pay-as-you-go. At 800 MB per study that is roughly **twelve studies of the
+current size before the first cent**, and the first cent is $0.015 — 50 GB
+would cost about $0.60 a month. Egress is free however much is read, which
+is the property that matters when the payload is imaging: the same workload
+on S3 would bill per gigabyte downloaded, forever, every time a cohort is
+re-reviewed.
+
+D1 and Workers do the opposite: on the free plan there is no billing
+relationship, so exceeding them returns errors until the daily window
+resets at 00:00 UTC rather than charging anything. Worth knowing because
+the failure is visible and sudden — an upload stops working — rather than
+quiet. Nothing is lost when it happens; the writes simply do not land.
+
+The number to actually watch is **R2 storage**, and only that one. It is
+the only limit that grows monotonically with use rather than resetting
+daily, and `wrangler r2 bucket info mri-review-blobs` reports it.
