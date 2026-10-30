@@ -168,13 +168,31 @@ export async function putFile(name, kind, bytes) {
 }
 
 export async function getFile(name, kind) {
-  const url = PER_USER_KINDS.has(kind)
-    ? `${caseUrl(name)}/mask`
-    : `${caseUrl(name)}/files/${kind}`;
+  const perUser = PER_USER_KINDS.has(kind);
+  const url = perUser ? `${caseUrl(name)}/mask` : `${caseUrl(name)}/files/${kind}`;
   const r = await req(url);
-  // A case with no mask yet is the normal state, not an error -- the local
-  // store returns undefined for a missing key and callers test for it.
-  if (r.status === 404) return undefined;
+
+  if (r.status === 404) {
+    // A SECOND REVIEWER OPENING A CASE HAS NO LAYER YET, AND MUST NOT BE
+    // SHOWN AN EMPTY MASK.
+    //
+    // The first reviewer's layer is seeded from the model at ingest. Anyone
+    // added to the workspace afterwards has nothing, and returning empty
+    // would draw every scan as having no tumour -- which in this kind of
+    // study is not a blank slate but a claim, and a plausible-looking one:
+    // genuinely tumour-free scans are real, expected, and concentrated in
+    // the treated arms. A reviewer told "no tumour" on every case they open
+    // would have no way to tell the difference.
+    //
+    // So their first view is the model's own output, which is what they are
+    // there to check. Their first save forks it into their own layer and
+    // nothing they do touches anyone else's.
+    if (perUser) {
+      const auto = await req(`${caseUrl(name)}/files/auto_mask`);
+      if (auto.ok) return new Uint8Array(await auto.arrayBuffer());
+    }
+    return undefined;
+  }
   if (!r.ok) throw new Error(`could not read ${kind}: ${r.status}`);
   return new Uint8Array(await r.arrayBuffer());
 }
@@ -187,7 +205,31 @@ export async function getUserMask(name, userId) {
   return new Uint8Array(await r.arrayBuffer());
 }
 
+/**
+ * Make sure the case row exists before anything is hung off it.
+ *
+ * The local store is IndexedDB, which has no foreign keys, so `pipeline.js`
+ * was written to upload a case's FILES first and write the case RECORD
+ * afterwards -- an order that is fine there and violates a foreign key here.
+ * The cloud store has to honour the contract the pipeline was written
+ * against, so it creates the parent row rather than making the pipeline
+ * reorder itself for one backend.
+ *
+ * The placeholder record is replaced moments later by the real one. Doing
+ * this explicitly, once, rather than relying on `image` happening to be the
+ * first key of the object passed to putFiles: that order is an
+ * implementation detail of an object literal three files away.
+ */
+async function ensureCase(name) {
+  await jsonReq(caseUrl(name), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ record: { case: name, incomplete: true } }),
+  });
+}
+
 export async function putFiles(name, files) {
+  await ensureCase(name);
   for (const [kind, bytes] of Object.entries(files)) {
     if (bytes != null) await putFile(name, kind, bytes);
   }

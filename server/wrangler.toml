@@ -7,7 +7,7 @@
 #   npm run dev     local: D1 and R2 are emulated on disk, nothing is uploaded
 #   npm run deploy  production
 #
-name = "mri-review"
+name = "mrisegment"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 

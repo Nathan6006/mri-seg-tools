@@ -77,6 +77,14 @@ const human = b => b<1024 ? b+' B'
   : b<1073741824 ? (b/1048576).toFixed(1)+' MB'
   : (b/1073741824).toFixed(2)+' GB';
 
+/* Escape text destined for innerHTML. Display names are chosen by whoever
+   registered the account, so they are the one string on this page that an
+   untrusted person controls directly. */
+function esc(s){
+  return String(s ?? '').replace(/[&<>"']/g,
+    (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
 function toast(msg, bad){
   const el = document.createElement('div');
   el.className = 'toast'+(bad?' bad':''); el.textContent = msg;
@@ -304,6 +312,15 @@ async function refresh(){
     ? `Results here are kept <strong>${pol.lifetime}</strong>. ${pol.note}`
     : null);
 
+  // Said once, because a stub silently becoming a real model is a change in
+  // what the numbers mean, and the person who stored that stub deserves to
+  // know it is no longer in effect.
+  if(STATE.stubReset && !STUB_RESET_TOLD){
+    STUB_RESET_TOLD = true;
+    toast('This browser had the stub predictor saved from an earlier visit. '
+        + 'A trained model is available here, so it is now in use.');
+  }
+
   const b = $('#stubBanner');
   if(STATE.model && !STATE.model_is_real){
     b.style.display='block';
@@ -390,6 +407,7 @@ function select(name){
   if(ED.on) edExit();
   releaseQC();
   SEL=name; SLICE=0;
+  clearCompare();   // a layer belongs to the case it was loaded for
   ZOOM.scale=1; ZOOM.x=0; ZOOM.y=0;   // a new scan starts at fit-to-window
   RULERS.clear();   // measurements belong to the scan they were drawn on
   t1CaseChanged();
@@ -435,6 +453,77 @@ async function loadVolume(name){
     VOL.mask = data;
     VOL.base = countOn(data);      // voxel count as it stands in storage
   }
+}
+
+/* ================= comparing another reviewer's outline =================
+   In a shared workspace each person has their own mask for a case. This
+   shows a colleague's beside your own, which is the thing that makes two
+   people reviewing the same cohort worth more than two people reviewing
+   half each: where they disagree is where the scan is genuinely hard.
+
+   It is also the inter-rater measurement the study needs, produced as a
+   by-product of ordinary review rather than as a separate exercise. */
+let CMP = null;   // {userId, label, data, stats} or null
+let STUB_RESET_TOLD = false;
+
+async function setCompare(userId){
+  if(!userId){ CMP = null; renderDetail(); return; }
+  const c = STATE.cases.find(x=>x.case===SEL);
+  const who = (c?.annotations||[]).find(a=>a.userId===userId);
+  try{
+    const got = await Backend.userMaskRaw(SEL, userId);
+    if(!got){ toast('That reviewer has not outlined this scan'); CMP = null; renderDetail(); return; }
+    await loadVolume(SEL);
+    CMP = {
+      userId,
+      label: who?.displayName || 'another reviewer',
+      data: got.data,
+      stats: Backend.compareMasks(VOL.mask, got.data),
+    };
+  }catch(e){ toast(e.message, true); CMP = null; }
+  renderDetail();
+}
+
+// A comparison belongs to one case; carrying it to the next scan would show
+// a mask from the wrong volume, which could easily be mistaken for a real
+// disagreement rather than a bug.
+function clearCompare(){ CMP = null; }
+
+/* The layer picker. Only rendered when there is something to compare: a
+   shared workspace, and at least one other person who has outlined THIS
+   scan. In local storage, or alone in a workspace, it does not exist --
+   an always-present control that is always empty is just clutter. */
+function compareControlHTML(c){
+  const others = (c.annotations || []).filter(a => !a.mine);
+  if(!others.length) return '';
+  const opts = others.map(a =>
+    `<option value="${esc(a.userId)}"${CMP && CMP.userId===a.userId ? ' selected' : ''}>${
+      esc(a.displayName)}${a.volume_mm3 != null ? ` — ${fmt(a.volume_mm3)}` : ''}</option>`
+  ).join('');
+  return `<label class="cmpsel" title="Show another reviewer's outline over yours">
+      <span class="meta">Compare</span>
+      <select id="cmpPick">
+        <option value="">off</option>
+        ${opts}
+      </select>
+    </label>`;
+}
+
+function compareLegend(){
+  if(!CMP) return '';
+  const s = CMP.stats;
+  const pct = (n) => `${n} voxel${n===1?'':'s'}`;
+  const dice = s.bothEmpty
+    ? 'both say no tumour'
+    : (s.dice === null ? '—' : s.dice.toFixed(3));
+  return `
+    <div class="cmpbar">
+      <span><i class="sw both"></i>agree ${pct(s.both)}</span>
+      <span><i class="sw mine"></i>only yours ${pct(s.onlyA)}</span>
+      <span><i class="sw theirs"></i>only ${esc(CMP.label.split(/\s+/)[0])}'s ${pct(s.onlyB)}</span>
+      <span class="spacer"></span>
+      <strong>Dice ${dice}</strong>
+    </div>`;
 }
 
 // Drop the cached mask so the next render re-reads it. Used after a save, an
@@ -534,14 +623,24 @@ function renderPane(plane){
       let g = (V[k] - lo)/span*255;
       g = g < 0 ? 0 : g > 255 ? 255 : g;
       a[o] = a[o+1] = a[o+2] = g; a[o+3] = 255;
-      if(M && M[k]){
+      const C = CMP && CMP.data;
+      const mine = M && M[k], theirs = C && C[k];
+      if(mine || theirs){
         // Edge voxels get near-full alpha so the boundary reads clearly even
         // with the fill turned right down -- which is how you actually judge
         // whether a mask is correct.
+        const on = mine ? M : C;
         const edge = u===0 || v===0 || u===w-1 || v===h-1
-          || !M[P.idx(u-1,v)] || !M[P.idx(u+1,v)]
-          || !M[P.idx(u,v-1)] || !M[P.idx(u,v+1)];
-        b[o] = 255; b[o+1] = 45; b[o+2] = 45; b[o+3] = edge ? 235 : 110;
+          || !on[P.idx(u-1,v)] || !on[P.idx(u+1,v)]
+          || !on[P.idx(u,v-1)] || !on[P.idx(u,v+1)];
+        // Without a comparison this is the red it has always been. With one,
+        // the three states are distinct colours, because "where do we
+        // differ" is the only question worth opening this view to answer.
+        if(!C){            b[o]=255; b[o+1]=45;  b[o+2]=45;  }
+        else if(mine && theirs){ b[o]=34;  b[o+1]=197; b[o+2]=94; }
+        else if(mine){     b[o]=255; b[o+1]=45;  b[o+2]=45;  }
+        else {             b[o]=59;  b[o+1]=130; b[o+2]=246; }
+        b[o+3] = edge ? 235 : 110;
       }
     }
   }
@@ -2189,9 +2288,11 @@ function renderDetail(){
             title="Show the T1 next to the T2, scrolling together (⇧⌘G).${
               c.t1 ? '' : ' This scan has no T1 stored yet.'}"
             >${t1Showing() ? 'Hide' : 'Show'} T1</button>
+          ${compareControlHTML(c)}
           <span class="spacer"></span>
           <span class="meta">scroll to change slice · click any pane to move the crosshair</span>
         </div>
+        ${compareLegend()}
 
         <div class="ctrls">
           <div class="ctrl">
@@ -2291,6 +2392,9 @@ function renderDetail(){
     PREFS.crosshair = PREFS.crosshair === false; savePrefs(); renderDetail();
   };
   $('#btnT1').onclick = toggleT1;
+  // Only present when somebody else has outlined this scan.
+  const cmpPick = $('#cmpPick');
+  if(cmpPick) cmpPick.onchange = () => setCompare(cmpPick.value || null);
 
   // Scroll wheel / two-finger scroll moves through slices, the way it works in
   // every radiology viewer. deltaY is accumulated rather than acted on

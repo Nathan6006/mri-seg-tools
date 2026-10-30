@@ -32,6 +32,8 @@ import { getPredictor } from './predictor.js';
 import { zip } from './gz.js';
 import * as localStore from './store.js';
 import * as cloudStore from './cloudstore.js';
+import * as store from './activestore.js';
+import { setActiveStore } from './activestore.js';
 
 /**
  * Which storage this session is using.
@@ -46,7 +48,6 @@ import * as cloudStore from './cloudstore.js';
  * Signing in is something you choose, and switching back is always possible:
  * nothing here ever deletes the local store.
  */
-let store = localStore;
 
 export const STORAGE_LOCAL = 'local';
 export const STORAGE_CLOUD = 'cloud';
@@ -59,9 +60,9 @@ export async function useStorage(mode, config = null) {
   if (mode === STORAGE_CLOUD) {
     if (!config?.workspaceId) throw new Error('a workspace is required');
     cloudStore.configure(config);
-    store = cloudStore;
+    setActiveStore(cloudStore);
   } else {
-    store = localStore;
+    setActiveStore(localStore);
   }
   storageMode = mode;
   cacheDrop();
@@ -71,6 +72,58 @@ export async function useStorage(mode, config = null) {
 }
 
 export { cloudStore };
+
+/**
+ * Another reviewer's annotation layer for the same case.
+ *
+ * Read-only by construction: there is no endpoint that writes to someone
+ * else's layer, so no amount of UI mistake here can damage their work.
+ *
+ * Returns null when there is nothing to show -- local storage (where layers
+ * do not exist), or a colleague who has not outlined this case. Both are
+ * ordinary, not errors.
+ */
+export async function userMaskRaw(name, userId) {
+  if (store.isLocal()) return null;
+  const rec = byName(name);
+  if (!rec) throw new Error('no such case');
+  const bytes = await cloudStore.getUserMask(name, userId);
+  if (!bytes) return null;
+  const { vol } = await decode(name);
+  const out = new Uint8Array(vol.nx * vol.ny * vol.nz);
+  const m = await readNifti(bytes);
+  for (let i = 0; i < out.length; i++) out[i] = m.data[i] > 0 ? 1 : 0;
+  return { data: out, meta: { nx: vol.nx, ny: vol.ny, nz: vol.nz } };
+}
+
+/**
+ * Dice between two binary masks on the same grid, plus the pieces it is made
+ * of -- which are what a reviewer actually looks at. Dice alone says "0.72"
+ * and not whether the disagreement is one person outlining consistently
+ * wider or the two finding different lesions.
+ *
+ * Dice is undefined when both masks are empty. That is not a failure: two
+ * reviewers agreeing a scan is tumour-free is perfect agreement, and
+ * reporting 0 would record it as total disagreement. The study's tumour-free
+ * scans are concentrated in the treated arms, so getting this wrong would
+ * bias exactly the comparison the work exists to make.
+ */
+export function compareMasks(a, b) {
+  let onlyA = 0, onlyB = 0, both = 0;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i] ? 1 : 0, y = b[i] ? 1 : 0;
+    if (x && y) both++;
+    else if (x) onlyA++;
+    else if (y) onlyB++;
+  }
+  const sizeA = both + onlyA, sizeB = both + onlyB;
+  return {
+    dice: (sizeA + sizeB) === 0 ? null : (2 * both) / (sizeA + sizeB),
+    both, onlyA, onlyB, sizeA, sizeB,
+    bothEmpty: sizeA === 0 && sizeB === 0,
+  };
+}
+
 import {
   EditedMaskError, LABEL_FILE, attachT1, fileNames, finalVolume,
   importCorrectedMask, processSession, refreshEdits, resultsJson, revertToAuto,
@@ -155,6 +208,10 @@ export function state() {
     model_error: STATE.modelError || null,
     model_choices: STATE.modelIndex ? STATE.modelIndex.models : null,
     model_id: STATE.modelId,
+    // True for the one render after a saved stub was discarded in favour of
+    // a real model, so the UI can explain the change rather than silently
+    // producing different numbers than it did last visit.
+    stubReset: !!STATE.stubReset,
     min_voxels: STATE.minVoxels,
     storage: STATE.storage,
     cases: STATE.cases,
@@ -241,6 +298,31 @@ async function _autoloadModel() {
       await store.setKV('model', 'onnx:no-tta');
     }
     await store.setKV('mirroring_default_changed', true);
+  }
+
+  // A STORED STUB DOES NOT SURVIVE A REAL MODEL BEING AVAILABLE.
+  //
+  // "Never override a deliberate choice" is right for the 2D model or for
+  // mirroring: both are real configurations someone might want. A stub is
+  // not. It exists so the tool could be built before a model existed, and it
+  // produces synthetic masks unrelated to the image.
+  //
+  // The failure this fixes: anyone who opened the tool while the weights
+  // were missing -- a deployment without web/model/, or a dev build -- has
+  // `stub:varied` written to their browser. That value then wins over the
+  // real model on every later visit, forever, on a site that is serving
+  // perfectly good weights. The symptom is the stub banner appearing on a
+  // deployment that definitely has a model, which looks like a broken
+  // deployment and is actually one stale byte of local storage.
+  //
+  // Resetting it is the safe direction. The cost of being wrong here is that
+  // someone deliberately testing the stub has to re-select it, and the
+  // banner tells them it is off. The cost of the other direction is silently
+  // recording fabricated tumour volumes.
+  if (index && typeof STATE.model === 'string' && STATE.model.startsWith('stub')) {
+    STATE.model = 'onnx:no-tta';
+    STATE.stubReset = true;              // so the UI can say why it changed
+    await store.setKV('model', 'onnx:no-tta');
   }
 
   const { bundle, id } = await onnx.autoloadBundle('./model/', preferId,

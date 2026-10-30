@@ -40,7 +40,9 @@ import { writeNiftiGz, readNifti } from './nifti.js';
 import { reviewScore, removeSmallComponents } from './predictor.js';
 import { countComponents, maskFacts } from './label.js';
 import { montage } from './qc.js';
-import * as store from './store.js';
+// NOT './store.js' -- see lib/activestore.js. Importing the local store
+// directly here is what made every cloud ingest write to IndexedDB.
+import * as store from './activestore.js';
 
 export const LABEL_FILE = `################################################
 # ITK-SnAP Label Description File
