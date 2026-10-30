@@ -49,14 +49,46 @@ export async function sha256Hex(text) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/**
+ * The Workers runtime refuses more than 100,000 PBKDF2 iterations in a
+ * single deriveBits call:
+ *
+ *   NotSupportedError: Pbkdf2 failed: iteration counts above 100000 are not
+ *   supported (requested 210000).
+ *
+ * The local dev runtime does NOT enforce this, so 210,000 worked through
+ * every local test and threw on the first real request after deploy. Worth
+ * remembering next time something cryptographic passes locally.
+ *
+ * Dropping to 100,000 would have been the easy fix and would have quietly
+ * halved the work factor to below the OWASP floor this was chosen to meet.
+ * Instead the work is CHAINED: each pass runs at most MAX_ITERATIONS and
+ * feeds its output in as the next pass's password. Total effort is the sum,
+ * so 210,000 still costs an attacker 210,000 iterations. Using the previous
+ * derived key as the next password is sound -- HMAC takes arbitrary key
+ * bytes -- and the salt stays the same throughout.
+ *
+ * The chunking rule has to stay fixed, because it is part of how a stored
+ * hash verifies: full 100,000 passes, then the remainder.
+ */
+const MAX_ITERATIONS = 100_000;   // the runtime's hard ceiling
+
 async function pbkdf2(password, salt, iterations) {
-  const key = await crypto.subtle.importKey(
-    'raw', enc.encode(password), 'PBKDF2', false, ['deriveBits'],
-  );
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, key, 256,
-  );
-  return new Uint8Array(bits);
+  let material = typeof password === 'string' ? enc.encode(password) : password;
+  let remaining = iterations;
+
+  while (remaining > 0) {
+    const round = Math.min(MAX_ITERATIONS, remaining);
+    const key = await crypto.subtle.importKey(
+      'raw', material, 'PBKDF2', false, ['deriveBits'],
+    );
+    const bits = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: round }, key, 256,
+    );
+    material = new Uint8Array(bits);
+    remaining -= round;
+  }
+  return material;
 }
 
 export async function hashPassword(password, iterations = PBKDF2_ITERATIONS) {
