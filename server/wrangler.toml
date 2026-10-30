@@ -1,0 +1,35 @@
+# The shared-workspace backend for the review tool.
+#
+# One Worker serves BOTH the static page and /api/*, which is not an
+# accident of convenience -- it is the thing that keeps the page's security
+# posture intact. See server/README.md, "Why one origin".
+#
+#   npm run dev     local: D1 and R2 are emulated on disk, nothing is uploaded
+#   npm run deploy  production
+#
+name = "mri-review"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# The existing static site, unchanged. Assets matching a request path are
+# served directly and never reach the Worker, so /api/* is the only thing
+# the script sees. web/_headers still applies -- COOP/COEP included.
+[assets]
+directory = "../web"
+binding = "ASSETS"
+not_found_handling = "none"
+
+# Scans and mask blobs. Never public: every read goes through the Worker so
+# it can check the session first.
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "mri-review-blobs"
+preview_bucket_name = "mri-review-blobs-dev"
+
+# Accounts, workspaces, membership, per-user annotation metadata.
+# Local dev ignores database_id and keeps its own copy under .wrangler/state.
+[[d1_databases]]
+binding = "DB"
+database_name = "mri-review"
+database_id = "be38ed67-ce89-4efa-9db9-1eb896aefeb6"
+migrations_dir = "migrations"

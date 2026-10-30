@@ -24,3 +24,10 @@ __pycache__/
 # here for local use and for a deploy; whether they go on a public URL is the
 # data owner's decision, not a build-step side effect.
 web/model/
+
+# Local seed data for the shared-workspace backend. Creates real named
+# accounts for testing, so it carries a person's name and a password and
+# must never be committed -- check_public.py would reject it anyway.
+server/seed.local.*
+server/node_modules/
+server/.wrangler/
