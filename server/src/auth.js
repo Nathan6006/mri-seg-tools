@@ -140,7 +140,8 @@ export async function createSession(db, userId, userAgent) {
 export async function userForToken(db, token) {
   if (!token) return null;
   const row = await db.prepare(
-    `SELECT u.id, u.username, u.display_name, u.email, s.expires_at
+    `SELECT u.id, u.username, u.display_name, u.email, u.approved, u.is_admin,
+            s.expires_at
        FROM sessions s JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = ?`,
   ).bind(await sha256Hex(token)).first();
@@ -149,7 +150,13 @@ export async function userForToken(db, token) {
     await destroySession(db, token);
     return null;
   }
-  return { id: row.id, username: row.username, displayName: row.display_name, email: row.email };
+  // approved/isAdmin are read fresh on every request rather than baked into
+  // the session, so revoking someone takes effect on their next click rather
+  // than whenever they happen to sign in again.
+  return {
+    id: row.id, username: row.username, displayName: row.display_name,
+    email: row.email, approved: !!row.approved, isAdmin: !!row.is_admin,
+  };
 }
 
 export async function destroySession(db, token) {

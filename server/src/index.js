@@ -31,6 +31,7 @@ import {
   readCookie, sessionCookie, throttleCheck, throttleClear, throttleFail,
   userForToken, verifyPassword,
 } from './auth.js';
+import { checkWrite, reconcile, settings, usage } from './quota.js';
 
 /* ------------------------------------------------------------- small utils */
 
@@ -107,27 +108,44 @@ async function handleRegister(request, env, url) {
   const pwHash = await hashPassword(password);
   const ts = now();
 
-  // A new account is useless without somewhere to put scans, so it gets a
-  // workspace of its own immediately rather than a "create your first
-  // workspace" step that everyone would click through anyway.
-  const workspaceId = randomId();
-  const wsName = `${displayName.split(/\s+/)[0]}'s workspace`;
+  // The FIRST account to register owns the instance: approved, and admin.
+  // Someone has to be able to approve the second person, and a hardcoded
+  // admin username in config would have to be edited and redeployed before
+  // anyone could log in at all. After that, approval is granted, never
+  // claimed -- which is the whole point, since an approved account spends
+  // storage billed to one person's card.
+  const first = await env.DB.prepare('SELECT COUNT(*) AS n FROM users').first();
+  const isFirst = Number(first?.n || 0) === 0;
 
-  await env.DB.batch([
-    env.DB.prepare(
-      'INSERT INTO users (id, username, display_name, email, pw_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-    ).bind(userId, username, displayName, email, pwHash, ts),
-    env.DB.prepare(
-      'INSERT INTO workspaces (id, name, slug, owner_id, created_at) VALUES (?, ?, ?, ?, ?)',
-    ).bind(workspaceId, wsName, slugify(wsName), userId, ts),
-    env.DB.prepare(
-      "INSERT INTO workspace_members (workspace_id, user_id, role, added_at) VALUES (?, ?, 'owner', ?)",
-    ).bind(workspaceId, userId, ts),
-  ]);
+  const statements = [env.DB.prepare(
+    `INSERT INTO users (id, username, display_name, email, pw_hash, created_at,
+                        approved, is_admin, approved_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(userId, username, displayName, email, pwHash, ts,
+         isFirst ? 1 : 0, isFirst ? 1 : 0, isFirst ? ts : null)];
+
+  // Only an approved account gets a workspace. Creating one for everybody
+  // would mean an unapproved visitor sees an empty shared workspace they
+  // cannot put anything in, which reads as a broken tool rather than a
+  // deliberate boundary.
+  if (isFirst) {
+    const workspaceId = randomId();
+    const wsName = `${displayName.split(/\s+/)[0]}'s workspace`;
+    statements.push(
+      env.DB.prepare(
+        'INSERT INTO workspaces (id, name, slug, owner_id, created_at) VALUES (?, ?, ?, ?, ?)',
+      ).bind(workspaceId, wsName, slugify(wsName), userId, ts),
+      env.DB.prepare(
+        "INSERT INTO workspace_members (workspace_id, user_id, role, added_at) VALUES (?, ?, 'owner', ?)",
+      ).bind(workspaceId, userId, ts),
+    );
+  }
+
+  await env.DB.batch(statements);
 
   const token = await createSession(env.DB, userId, request.headers.get('User-Agent'));
   return json(
-    { user: { id: userId, username, displayName, email } },
+    { user: { id: userId, username, displayName, email, approved: isFirst, isAdmin: isFirst } },
     { status: 201, headers: { 'Set-Cookie': sessionCookie(token, url) } },
   );
 }
@@ -146,7 +164,7 @@ async function handleLogin(request, env, url) {
   }
 
   const row = await env.DB.prepare(
-    'SELECT id, username, display_name, email, pw_hash FROM users WHERE username = ?',
+    'SELECT id, username, display_name, email, pw_hash, approved, is_admin FROM users WHERE username = ?',
   ).bind(username).first();
 
   // The same message and roughly the same work either way: a fast "no such
@@ -166,7 +184,10 @@ async function handleLogin(request, env, url) {
 
   const token = await createSession(env.DB, row.id, request.headers.get('User-Agent'));
   return json(
-    { user: { id: row.id, username: row.username, displayName: row.display_name, email: row.email } },
+    { user: {
+      id: row.id, username: row.username, displayName: row.display_name,
+      email: row.email, approved: !!row.approved, isAdmin: !!row.is_admin,
+    } },
     { headers: { 'Set-Cookie': sessionCookie(token, url) } },
   );
 }
@@ -402,20 +423,31 @@ async function saveAnnotation(request, env, workspaceId, caseName, user) {
     return fail(404, 'That scan is no longer in this workspace. Someone may have removed it.');
   }
 
+  // Re-saving a mask over itself is the commonest write this tool makes, so
+  // the size it is REPLACING is subtracted before the check. Without that, a
+  // workspace at the ceiling could not be corrected, only emptied.
+  const prior = await env.DB.prepare(
+    'SELECT bytes FROM annotations WHERE workspace_id = ? AND case_name = ? AND user_id = ?',
+  ).bind(workspaceId, caseName, user.id).first();
+  const incoming = Number(request.headers.get('Content-Length') || 0);
+  const refusal = await checkWrite(env, incoming, Number(prior?.bytes || 0));
+  if (refusal) return fail(507, refusal, { code: 'quota_exceeded', usage: await usage(env) });
+
   const key = maskKey(workspaceId, caseName, user.id);
   const put = await putBlob(request, env, key);
   if (put instanceof Response) return put;
 
   const ts = now();
   await env.DB.prepare(
-    `INSERT INTO annotations (workspace_id, case_name, user_id, r2_key, volume_mm3, voxels, edited, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO annotations (workspace_id, case_name, user_id, r2_key, volume_mm3, voxels, edited, bytes, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(workspace_id, case_name, user_id) DO UPDATE SET
        r2_key = excluded.r2_key, volume_mm3 = excluded.volume_mm3,
-       voxels = excluded.voxels, edited = excluded.edited, updated_at = excluded.updated_at`,
-  ).bind(workspaceId, caseName, user.id, key, volume, voxels, edited ? 1 : 0, ts).run();
+       voxels = excluded.voxels, edited = excluded.edited,
+       bytes = excluded.bytes, updated_at = excluded.updated_at`,
+  ).bind(workspaceId, caseName, user.id, key, volume, voxels, edited ? 1 : 0, put.bytes, ts).run();
 
-  return json({ ok: true, bytes: put.bytes, updated_at: ts });
+  return json({ ok: true, bytes: put.bytes, updated_at: ts, usage: await usage(env) });
 }
 
 async function saveReview(request, env, workspaceId, caseName, user) {
@@ -430,6 +462,172 @@ async function saveReview(request, env, workspaceId, caseName, user) {
        verdict = excluded.verdict, note = excluded.note, updated_at = excluded.updated_at`,
   ).bind(workspaceId, caseName, user.id, verdict, note, ts).run();
   return json({ ok: true, updated_at: ts });
+}
+
+/* ==================================================== files and admin */
+
+/**
+ * Everything the Files panel needs, in one request.
+ *
+ * Deliberately one round trip rather than a listing plus a size lookup per
+ * case: the panel exists to answer "what is taking up the room and what can
+ * go", and a list that fills in its sizes afterwards is a list you cannot
+ * sort by size until it settles.
+ */
+async function listFiles(env, workspaceId, userId) {
+  const [files, annotations, cases] = await Promise.all([
+    env.DB.prepare(
+      'SELECT case_name, kind, bytes, updated_at FROM case_files WHERE workspace_id = ?',
+    ).bind(workspaceId).all(),
+    env.DB.prepare(
+      `SELECT a.case_name, a.user_id, a.bytes, a.updated_at, a.edited,
+              a.volume_mm3, u.username, u.display_name
+         FROM annotations a JOIN users u ON u.id = a.user_id
+        WHERE a.workspace_id = ?`,
+    ).bind(workspaceId).all(),
+    env.DB.prepare(
+      `SELECT c.name, c.created_at, c.updated_at, u.display_name AS added_by
+         FROM cases c LEFT JOIN users u ON u.id = c.created_by
+        WHERE c.workspace_id = ? ORDER BY c.name`,
+    ).bind(workspaceId).all(),
+  ]);
+
+  const byCase = new Map();
+  for (const c of cases.results || []) {
+    byCase.set(c.name, {
+      case: c.name, addedBy: c.added_by, createdAt: c.created_at,
+      updatedAt: c.updated_at, files: [], layers: [], bytes: 0,
+    });
+  }
+  for (const f of files.results || []) {
+    const entry = byCase.get(f.case_name);
+    if (!entry) continue;
+    entry.files.push({ kind: f.kind, bytes: f.bytes, updatedAt: f.updated_at });
+    entry.bytes += f.bytes;
+  }
+  for (const a of annotations.results || []) {
+    const entry = byCase.get(a.case_name);
+    if (!entry) continue;
+    entry.layers.push({
+      username: a.username, displayName: a.display_name, bytes: a.bytes,
+      edited: !!a.edited, volume_mm3: a.volume_mm3, updatedAt: a.updated_at,
+      mine: a.user_id === userId,
+    });
+    entry.bytes += a.bytes;
+  }
+
+  const items = [...byCase.values()];
+  return json({
+    items,
+    totals: {
+      cases: items.length,
+      bytes: items.reduce((s, i) => s + i.bytes, 0),
+    },
+    usage: await usage(env),
+  });
+}
+
+/** Delete several cases at once, reporting what actually went. */
+async function bulkDelete(request, env, workspaceId) {
+  const body = await readJson(request);
+  const names = Array.isArray(body?.names) ? body.names.slice(0, 500) : null;
+  if (!names?.length) return fail(400, 'Nothing selected.');
+
+  let freed = 0;
+  const deleted = [];
+  for (const name of names) {
+    if (!CASE_RE.test(name)) continue;
+    const row = await env.DB.prepare(
+      `SELECT (SELECT COALESCE(SUM(bytes),0) FROM case_files
+                WHERE workspace_id = ?1 AND case_name = ?2)
+            + (SELECT COALESCE(SUM(bytes),0) FROM annotations
+                WHERE workspace_id = ?1 AND case_name = ?2) AS b`,
+    ).bind(workspaceId, name).first();
+    await deleteCase(env, workspaceId, name);
+    freed += Number(row?.b || 0);
+    deleted.push(name);
+  }
+  return json({ ok: true, deleted, freedBytes: freed, usage: await usage(env) });
+}
+
+async function adminListUsers(env) {
+  const { results } = await env.DB.prepare(
+    `SELECT u.id, u.username, u.display_name, u.email, u.created_at,
+            u.last_login_at, u.approved, u.is_admin,
+            (SELECT COUNT(*) FROM workspace_members m WHERE m.user_id = u.id) AS n_workspaces
+       FROM users u ORDER BY u.approved DESC, u.created_at`,
+  ).all();
+  return json({
+    users: (results || []).map((u) => ({
+      ...u, approved: !!u.approved, is_admin: !!u.is_admin,
+    })),
+  });
+}
+
+async function adminSetApproval(request, env, actor, targetId) {
+  const body = await readJson(request);
+  const approved = !!body?.approved;
+
+  const target = await env.DB.prepare(
+    'SELECT id, username, display_name, is_admin FROM users WHERE id = ?',
+  ).bind(targetId).first();
+  if (!target) return fail(404, 'No such account.');
+
+  // An admin removing their own approval would lock the instance out of its
+  // own administration, with no way back that does not involve editing the
+  // database by hand.
+  if (!approved && target.id === actor.id) {
+    return fail(400, 'You cannot remove your own access.');
+  }
+
+  await env.DB.prepare(
+    'UPDATE users SET approved = ?, approved_at = ?, approved_by = ? WHERE id = ?',
+  ).bind(approved ? 1 : 0, approved ? now() : null, approved ? actor.id : null, targetId).run();
+
+  // Revoking access does not delete their work: the masks they drew stay in
+  // the workspace, which is what the study needs. It only stops them opening
+  // it. Removing someone's data is a separate, deliberate act.
+  if (!approved) {
+    await env.DB.prepare('DELETE FROM workspace_members WHERE user_id = ?').bind(targetId).run();
+  }
+
+  return json({ ok: true, user: { id: target.id, username: target.username, approved } });
+}
+
+async function adminSetAdmin(request, env, actor, targetId) {
+  const body = await readJson(request);
+  const makeAdmin = !!body?.isAdmin;
+  if (!makeAdmin && targetId === actor.id) {
+    const others = await env.DB.prepare(
+      'SELECT COUNT(*) AS n FROM users WHERE is_admin = 1 AND id != ?',
+    ).bind(actor.id).first();
+    if (Number(others?.n || 0) === 0) {
+      return fail(400, 'You are the only administrator. Promote someone else first.');
+    }
+  }
+  // Admin implies approved: an administrator who cannot open a workspace
+  // cannot check whether the thing they are administering works.
+  await env.DB.prepare(
+    `UPDATE users SET is_admin = ?, approved = CASE WHEN ? = 1 THEN 1 ELSE approved END
+      WHERE id = ?`,
+  ).bind(makeAdmin ? 1 : 0, makeAdmin ? 1 : 0, targetId).run();
+  return json({ ok: true });
+}
+
+async function adminSetQuota(request, env) {
+  const body = await readJson(request);
+  const out = {};
+  for (const key of ['quota_bytes', 'warn_fraction', 'critical_fraction']) {
+    if (body?.[key] === undefined) continue;
+    const n = Number(body[key]);
+    if (!Number.isFinite(n) || n <= 0) return fail(400, `${key} must be a positive number.`);
+    await env.DB.prepare(
+      'INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ' +
+      'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+    ).bind(key, String(n), now()).run();
+    out[key] = n;
+  }
+  return json({ ok: true, settings: { ...(await settings(env)), ...out } });
 }
 
 /* ================================================================== routing */
@@ -451,14 +649,47 @@ async function route(request, env, url) {
   }
   if (!user) return fail(401, 'Please sign in.');
 
+  /* -- admin -- */
+  if (path.startsWith('/api/admin/')) {
+    if (!user.isAdmin) return fail(404, 'No such endpoint.');
+    if (path === '/api/admin/users' && method === 'GET') return adminListUsers(env);
+    if (path === '/api/admin/settings' && method === 'POST') return adminSetQuota(request, env);
+    if (path === '/api/admin/reconcile' && method === 'POST') return json(await reconcile(env));
+    if (seg.length === 5 && seg[2] === 'users' && seg[4] === 'approve' && method === 'POST') {
+      return adminSetApproval(request, env, user, seg[3]);
+    }
+    if (seg.length === 5 && seg[2] === 'users' && seg[4] === 'admin' && method === 'POST') {
+      return adminSetAdmin(request, env, user, seg[3]);
+    }
+    return fail(404, 'No such endpoint.');
+  }
+
+  // Usage is visible to any approved member: the people who can fill the
+  // storage are the people who should be able to see how full it is.
+  if (path === '/api/usage' && method === 'GET') {
+    if (!user.approved) return fail(403, 'This account is not approved for shared workspaces.');
+    return json(await usage(env));
+  }
+
+  /* -- the approval gate --
+     Unapproved is a normal state, not an error: the page falls back to
+     local-only storage, which is exactly how the tool worked before any of
+     this existed. 403 with a specific code so the client can say something
+     useful rather than "something went wrong". */
+  const APPROVAL_MSG = 'This account is not approved for shared workspaces yet. '
+    + 'You can still use the tool with results stored in this browser. '
+    + 'Ask the workspace owner to approve your username.';
+
   /* -- workspaces -- */
   if (path === '/api/workspaces') {
+    if (!user.approved) return fail(403, APPROVAL_MSG, { code: 'not_approved' });
     if (method === 'GET') return listWorkspaces(env, user);
     if (method === 'POST') return createWorkspace(request, env, user);
   }
 
   // /api/w/<workspaceId>/...
   if (seg[0] === 'api' && seg[1] === 'w' && seg[2]) {
+    if (!user.approved) return fail(403, APPROVAL_MSG, { code: 'not_approved' });
     const workspaceId = seg[2];
     const member = await membership(env, workspaceId, user.id);
     // 404 rather than 403: a non-member should not be able to learn that a
@@ -476,6 +707,16 @@ async function route(request, env, url) {
 
     if (seg.length === 4 && seg[3] === 'cases' && method === 'GET') {
       return listCases(env, workspaceId, user.id);
+    }
+    if (seg.length === 4 && seg[3] === 'files' && method === 'GET') {
+      return listFiles(env, workspaceId, user.id);
+    }
+    // Not /cases/delete: a case may legitimately be NAMED "delete", and the
+    // two would then differ only by HTTP method, which is the kind of
+    // collision that works until the day it does not.
+    if (seg.length === 4 && seg[3] === 'delete-cases' && method === 'POST') {
+      if (!canWrite) return fail(403, 'You have read-only access to this workspace.');
+      return bulkDelete(request, env, workspaceId);
     }
 
     if (seg[3] === 'cases' && seg[4]) {
@@ -501,6 +742,16 @@ async function route(request, env, url) {
         if (method === 'GET') return getBlob(env, key, request);
         if (method === 'PUT') {
           if (!canWrite) return fail(403, 'You have read-only access to this workspace.');
+
+          // Checked BEFORE the put. A write that lands and is then rolled
+          // back has already been stored and already counts.
+          const incoming = Number(request.headers.get('Content-Length') || 0);
+          const prior = await env.DB.prepare(
+            'SELECT bytes FROM case_files WHERE workspace_id = ? AND case_name = ? AND kind = ?',
+          ).bind(workspaceId, caseName, kind).first();
+          const refusal = await checkWrite(env, incoming, Number(prior?.bytes || 0));
+          if (refusal) return fail(507, refusal, { code: 'quota_exceeded', usage: await usage(env) });
+
           const put = await putBlob(request, env, key);
           if (put instanceof Response) return put;
           await env.DB.prepare(
@@ -509,7 +760,7 @@ async function route(request, env, url) {
              ON CONFLICT(workspace_id, case_name, kind) DO UPDATE SET
                r2_key = excluded.r2_key, bytes = excluded.bytes, updated_at = excluded.updated_at`,
           ).bind(workspaceId, caseName, kind, key, put.bytes, now()).run();
-          return json({ ok: true, bytes: put.bytes });
+          return json({ ok: true, bytes: put.bytes, usage: await usage(env) });
         }
       }
 

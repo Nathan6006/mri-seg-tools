@@ -127,6 +127,20 @@ async function serverMessage(response, fallback) {
   return `${fallback} (${response.status})`;
 }
 
+/**
+ * Every write answers with the account's storage usage, and that answer is
+ * broadcast rather than returned.
+ *
+ * An event, not an import, because `account.js` already imports `backend.js`
+ * which imports this file -- having this one reach back for the header would
+ * close the loop. It also means the ingest path needs no changes at all: the
+ * meter updates because bytes moved, wherever in the code they moved from.
+ */
+function announceUsage(usage) {
+  if (!usage) return;
+  window.dispatchEvent(new CustomEvent('mriseg:usage', { detail: usage }));
+}
+
 export async function putFile(name, kind, bytes) {
   const body = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   const perUser = PER_USER_KINDS.has(kind);
@@ -138,9 +152,19 @@ export async function putFile(name, kind, bytes) {
     body,
   });
   if (!r.ok) {
+    // 507 is the quota ceiling. Its message already explains what to do, so
+    // it is passed through verbatim rather than wrapped in "could not
+    // upload image", which would bury the actionable half.
+    let payload = null;
+    try { payload = await r.clone().json(); } catch { /* no body */ }
+    if (payload?.usage) announceUsage(payload.usage);
+    if (payload?.code === 'quota_exceeded') {
+      throw Object.assign(new Error(payload.error), { quotaExceeded: true });
+    }
     throw new Error(await serverMessage(
       r, perUser ? 'could not save your mask' : `could not upload ${kind}`));
   }
+  try { announceUsage((await r.json()).usage); } catch { /* no body is fine */ }
 }
 
 export async function getFile(name, kind) {

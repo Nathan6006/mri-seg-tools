@@ -108,6 +108,67 @@ Verified in a browser: a case written to local storage, with its mask bytes
 and volume, is byte-identical after switching to a cloud workspace and back.
 The two stores never see each other.
 
+
+## Who can use the shared storage
+
+Anyone may register. Only **approved** accounts can open a shared workspace;
+everyone else gets the full tool with results in their own browser, exactly
+as it worked before accounts existed. That boundary exists because shared
+storage is billed to one person's card, so access is granted rather than
+claimed.
+
+The **first account to register becomes the administrator** and is approved
+automatically — somebody has to be able to approve the second person, and a
+username hardcoded in config would need a redeploy before anyone could sign
+in at all. After that, Workspaces → Accounts approves, revokes and promotes.
+
+Revoking does **not** delete anyone's work. Their masks stay in the
+workspace, which is what the study needs; it only stops them opening it.
+Removing data is a separate, deliberate act in the Files panel.
+
+## The storage cap
+
+R2 has no spend limit and Cloudflare will not add one, so the cap is
+enforced here instead. It works because the Worker is the only holder of
+bucket credentials: nothing else can write a byte, so a check in front of
+every write is a real ceiling rather than an alert after the money is gone.
+The check runs **before** the R2 put — a write that lands and is then rolled
+back has already been stored and already counts.
+
+Default ceiling is **9 GiB against R2's 10 GB free tier**. The headroom is
+deliberate: R2 bills on a monthly average and rounds up, deletes take a
+moment to stop counting, and a cap sitting exactly on the free tier would
+bill for the rounding. Adjustable in Accounts without a redeploy.
+
+| Level | At | What happens |
+|---|---|---|
+| warn | 75% | banner in the Workspaces and Files panels |
+| critical | 90% | stronger banner naming the remaining space |
+| full | 100% | uploads refused with HTTP 507 and an actionable message |
+
+Usage is a SUM over the rows that own blobs, not a running counter. A
+counter is faster and is wrong the first time a delete half-fails — and it
+drifts toward under-counting, which is the direction that costs money. It
+can still disagree with what R2 actually holds; **Accounts → Check storage**
+compares the two. That reports drift rather than "fixing" it, because the
+two ways drift happens need opposite repairs: an object with no row is
+garbage, a row with no object is a failed upload to redo. Deciding that
+automatically is how a reconciler deletes someone's data.
+
+## The Files panel
+
+Workspaces → Files. Sorted largest-first by default, because the reason to
+open it under pressure is to find what to delete.
+
+Navigable the way the worklist is — `↑` `↓` move, `space` selects, `del`
+deletes, `esc` closes — because the reviewer this was built for singled out
+clicking between scans as the thing he liked, and a panel that only takes a
+mouse would be a step down from what sits next to it. Each row shows a size
+bar relative to the largest item, a breakdown by file kind, whose mask
+layers exist, and who added it. The delete button names what will be freed
+before it is pressed, and the confirmation says how many other people's
+layers go with it.
+
 ## Costs, and what happens when something runs out
 
 Free at this scale, but the three services fail in **two different ways**,
